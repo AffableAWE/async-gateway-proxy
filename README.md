@@ -1,4 +1,4 @@
-# PyGate
+e# PyGate
 
 A lightweight Python-based API Gateway / Reverse Proxy built to route requests to backend services with authentication, rate limiting, logging, retries, and config-driven routing.
 
@@ -26,4 +26,3 @@ Initial project setup.
 
 The first milestone is to implement a minimal working reverse proxy: receive an HTTP request, match it against `config.yaml`, forward it to the correct backend, and return the backend response to the client.
 
-This project is intended to demonstrate backend infrastructure fundamentals such as service-to-service communication, request routing, observability, and containerized deployment.
