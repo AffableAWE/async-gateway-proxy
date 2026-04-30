@@ -20,8 +20,6 @@ Build a configurable async gateway that sits in front of multiple backend servic
 
 ## Status
 
-Initial project setup.
-
 ## Current Focus
 
 The first milestone is to implement a minimal working reverse proxy: receive an HTTP request, match it against `config.yaml`, forward it to the correct backend, and return the backend response to the client.
