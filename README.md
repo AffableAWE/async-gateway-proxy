@@ -14,9 +14,7 @@ A lightweight Python-based API Gateway / Reverse Proxy built to route requests t
 - Kubernetes
 - C++ backend service
 
-## Goal
 
-Build a configurable async gateway that sits in front of multiple backend services, including a custom C++ HTTP server, and forwards requests based on route rules defined in a YAML config.
 
 
 
