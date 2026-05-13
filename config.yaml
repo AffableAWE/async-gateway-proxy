@@ -1,0 +1,6 @@
+routes:
+  - path_prefix: "/service-a"
+    upstream: "http://localhost:9001"
+
+  - path_prefix: "/service-b"
+    upstream: "http://localhost:9002"
