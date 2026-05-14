@@ -1,6 +1,6 @@
 # PyGate
 
-### 🔄 Request Flow
+### Request Flow
 The current execution logic follows these steps:
 
 1. **Receive Request**
@@ -10,7 +10,7 @@ The current execution logic follows these steps:
 
 ---
 
-### 🛠 Quick Logic Reference
+### Quick Logic Reference
 ```text
 Client Request 
       ↓
