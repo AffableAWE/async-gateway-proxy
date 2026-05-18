@@ -9,11 +9,4 @@ The current execution logic follows these steps:
 4. **Return Response**
 
 
-```text
-Client Request 
-      ↓
-Identify Upstream
-      ↓
-forward_request()
-      ↓
-Client Response
+
