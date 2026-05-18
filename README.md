@@ -8,7 +8,6 @@ The current execution logic follows these steps:
 3. **Call `forward_request`**
 4. **Return Response**
 
-### Quick Logic Reference
 
 ```text
 Client Request 
