@@ -1,9 +1,6 @@
-# PyGate
+# Async API Gateway (MVP)
 
-### Request Flow
-The current execution logic follows these steps:
+A minimal async API gateway / reverse proxy in Python. Routes incoming HTTP
+requests to configured upstream services based on path prefixes.
 
-1. **Receive Request**
-2. **Find Matching Upstream**
-3. **Call `forward_request`**
-4. **Return Response**
+## Architecture
