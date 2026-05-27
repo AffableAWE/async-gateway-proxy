@@ -77,6 +77,7 @@ pytest
 - **No upstream health checks** — readiness reflects the gateway process only.
 - **Static config** — changes require a restart. No hot reload.
 - **No TLS termination** — assumes a separate ingress for HTTPS.
+- **No distributed tracing** — only single-line structured logs.
 
 
 ## Future improvements
