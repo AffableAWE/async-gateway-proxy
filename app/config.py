@@ -21,3 +21,9 @@ class RouteConfig(BaseModel):
 
     @field_validator("upstream")
     @classmethod
+    
+    def upstream_must_be_url(cls, v: str) -> str:
+        # Pydantic's HttpUrl is strict; we want a string we can pass to httpx,
+        # so we validate then return as str. This catches typos like missing scheme.
+        HttpUrl(v)
+        return v.rstrip("/")
