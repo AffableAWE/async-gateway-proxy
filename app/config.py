@@ -27,3 +27,9 @@ class RouteConfig(BaseModel):
         # so we validate then return as str. This catches typos like missing scheme.
         HttpUrl(v)
         return v.rstrip("/")
+
+class GatewayConfig(BaseModel):
+    """Top-level config object. Add fields here as the gateway grows
+    (timeouts, auth keys, rate limits) — every new feature gets a typed home."""
+    routes: List[RouteConfig]
+    upstream_timeout_seconds: float = 5.0
