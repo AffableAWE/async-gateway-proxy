@@ -33,3 +33,13 @@ class GatewayConfig(BaseModel):
     (timeouts, auth keys, rate limits) — every new feature gets a typed home."""
     routes: List[RouteConfig]
     upstream_timeout_seconds: float = 5.0
+
+def load_config(path: str | Path) -> GatewayConfig:
+    """Read YAML from disk and parse into a validated GatewayConfig.
+    Called once at startup from main.py's lifespan."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r") as f:
+        raw = yaml.safe_load(f)  # safe_load avoids arbitrary code execution from YAML tags
+    return GatewayConfig(**raw)
