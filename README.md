@@ -69,7 +69,7 @@ curl -i http://localhost:8000/nope
 pytest
 ```
 
-## Limitations (deliberate, for an MVP).
+## Limitations (deliberate, for an MVP)
 
 - **Buffers full request/response bodies** — unsuitable for large uploads,
   SSE, or websockets. Production would use streaming.
