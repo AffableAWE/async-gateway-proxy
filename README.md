@@ -72,7 +72,7 @@ pytest
 ## Limitations (deliberate, for an MVP)
 
 - **Buffers full request/response bodies** — unsuitable for large uploads,
-  SSE, or websockets. Production would use streaming.
+  SSE, or websockets. Production would use streaming..
 - **No authentication, rate limiting, or retries.**
 - **No upstream health checks** — readiness reflects the gateway process only.
 - **Static config** — changes require a restart. No hot reload.
