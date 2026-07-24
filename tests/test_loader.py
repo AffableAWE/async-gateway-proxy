@@ -10,4 +10,6 @@ print(route)
 assert route is not None
 assert route.upstream == "http://localhost:9001"
 
+print("Test passed")
+
 
