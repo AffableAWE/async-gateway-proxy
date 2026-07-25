@@ -84,6 +84,7 @@ pytest
 
 - Stream bodies via `httpx.stream()` + `StreamingResponse`.
 - API key middleware (header-based, validated against config).
+- Token-bucket rate limiting per API key.
 - Retry with exponential backoff and jitter for idempotent methods.
 - Circuit breaker per upstream to avoid hammering a failing service.
 - Distributed tracing via OpenTelemetry (W3C `traceparent` propagation).
