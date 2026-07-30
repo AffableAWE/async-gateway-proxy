@@ -16,7 +16,7 @@ class RouteConfig(BaseModel):
     def prefix_must_start_with_slash(cls, v: str) -> str:
         if not v.startswith("/"):
             raise ValueError(f"prefix must start with '/': got {v!r}")
-        # Normalize: strip trailing slash so '/users/' and '/users' behave the same. idk 
+        # Normalize: strip trailing slash so '/users/' and '/users' behave the same.
         return v.rstrip("/") or "/"
 
     @field_validator("upstream")
