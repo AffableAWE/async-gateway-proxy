@@ -1,4 +1,4 @@
-import yaml.
+import yaml
 
 from app.config.models import AppConfig
 
