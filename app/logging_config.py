@@ -15,8 +15,7 @@ class JsonFormatter(logging.Formatter):
     (request_id, upstream, status_code, latency_ms) without string-formatting.
     """
 
-    # Standard fields that logging always adds — we don't want them duplicated
-    # in the JSON output as random keys.
+    # Standard fields that logging always adds — we don't want them duplicated in the JSON output as random keys.
     _RESERVED = {
         "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
         "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
