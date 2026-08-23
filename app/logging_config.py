@@ -5,7 +5,6 @@ import logging
 import sys
 import time
 from typing import Any
-import jadhav
 
 class JsonFormatter(logging.Formatter):
     """Renders each log record as one JSON line.
