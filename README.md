@@ -2,6 +2,8 @@
 
 ## changes will soon start reflecting in the repo
 
+## 3 phases out of 6 has been completed in the local dir
+
 A minimal async API gateway / reverse proxy in Python. Routes incoming HTTP
 requests to configured upstream services based on path prefixes.
 
