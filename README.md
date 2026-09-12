@@ -4,7 +4,7 @@
 
 ## 3 phases out of 6 has been completed in the local dir, might be pushing the code on the VPS than start commiting all the changes.
 
-## writting tests
+## writting tests - implementing the logs
 
 
 A minimal async API gateway / reverse proxy in Python. Routes incoming HTTP
