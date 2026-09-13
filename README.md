@@ -1,8 +1,5 @@
 # Async API Gateway (MVP) - Will be refactoring everything in this project this week.
 
-## changes will soon start reflecting in the repo
-
-
 A minimal async API gateway / reverse proxy in Python. Routes incoming HTTP
 requests to configured upstream services based on path prefixes.
 
