@@ -48,7 +48,6 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
     root.setLevel(level)
 
-    # Uvicorn has its own loggers; quiet them down to avoid noisy plain-text access logs.
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(name).handlers.clear()
         logging.getLogger(name).propagate = True
