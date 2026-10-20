@@ -9,7 +9,7 @@ requests to configured upstream services based on path prefixes.
 
 The gateway is async end-to-end: Uvicorn runs on asyncio, FastAPI handlers
 are coroutines, and outbound calls use `httpx.AsyncClient` from a single
-connection-pooled client created at startup...
+connection-pooled client created at startup..
 
 ## Setup (local)
 
