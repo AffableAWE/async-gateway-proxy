@@ -1,0 +1,15 @@
+# Gateway routing table.
+# Each route sends requests whose path starts with path_prefix to upstream.
+# The longest matching prefix wins.
+
+upstream_timeout_seconds: 5.0
+
+routes:
+  # Dummy upstream for local development:
+  #   uvicorn dummy_upstream.main:app --port 8001
+  - path_prefix: /api
+    upstream: http://localhost:8001
+
+  # Your C++ HTTP server. Uncomment and set the port it listens on.
+  # - path_prefix: /cpp
+  #   upstream: http://localhost:8080
