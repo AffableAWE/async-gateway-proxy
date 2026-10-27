@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    # Starlette's TestClient prefers the newer httpx2 package. Plain httpx
+    # still works, and the gateway itself uses httpx, so we keep one client.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/F: pyflakes + pycodestyle, I: import order, B: common bugs, UP: modern syntax
+select = ["E", "F", "I", "B", "UP"]
