@@ -5,6 +5,10 @@ Usage anywhere in the app:
 
 The message is the event name. Everything in `extra` becomes a top-level
 field, so log tools (Loki, ELK, Datadog) can filter on it.
+
+Inside a request, every line also gets a `request_id` field automatically.
+Never pass `request_id` in `extra` yourself: logging raises KeyError when
+`extra` tries to overwrite an attribute the record already has.
 """
 
 import json
@@ -12,6 +16,8 @@ import logging
 import sys
 from datetime import UTC, datetime
 from typing import Any
+
+from app.request_context import get_request_id
 
 # Attributes every LogRecord has. We skip them so only our own `extra`
 # fields end up in the JSON. `color_message` is added by uvicorn.
@@ -40,8 +46,33 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+def install_request_id_factory() -> None:
+    """Stamp the current request ID onto every log record as it is created.
+
+    Why a record factory and not a logging.Filter: a filter on a logger does
+    not run for records coming up from child loggers, and a filter on our
+    handler would miss other handlers (pytest's log capture, for one). The
+    factory runs once per record, before any logger or handler sees it.
+    """
+    old_factory = logging.getLogRecordFactory()
+    if getattr(old_factory, "adds_request_id", False):
+        return  # already installed; don't wrap twice
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = old_factory(*args, **kwargs)
+        request_id = get_request_id()
+        if request_id is not None:  # outside a request, leave the field out
+            record.request_id = request_id
+        return record
+
+    factory.adds_request_id = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
+
+
 def setup_logging(level: str = "INFO") -> None:
     """Send all logs through one JSON handler on stdout. Safe to call twice."""
+    install_request_id_factory()
+
     root = logging.getLogger()
     root.setLevel(level)
 
