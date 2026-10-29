@@ -14,7 +14,9 @@ from fastapi.responses import JSONResponse
 
 from app.config import GatewayConfig, load_config
 from app.logging_config import setup_logging
+from app.middleware.request_id import RequestIDMiddleware
 from app.proxy import forward_request
+from app.request_context import get_request_id
 from app.router import match_route
 
 logger = logging.getLogger("gateway.main")
@@ -74,6 +76,11 @@ def create_app(
     # should be proxied like any other path, not answered by FastAPI.
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
+    # Middleware order: the last one added runs first (outermost). The
+    # request ID must be outermost so that auth and rate-limit rejections
+    # added in later phases are logged with an ID too.
+    app.add_middleware(RequestIDMiddleware)
+
     @app.get("/health")
     async def health() -> dict:
         """Liveness: is this process up and is its event loop responding?
@@ -97,7 +104,11 @@ def create_app(
             )
             return JSONResponse(
                 status_code=404,
-                content={"error": "no matching route", "path": request.url.path},
+                content={
+                    "error": "no matching route",
+                    "path": request.url.path,
+                    "request_id": get_request_id(),
+                },
             )
 
         return await forward_request(

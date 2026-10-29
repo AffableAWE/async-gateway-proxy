@@ -47,7 +47,11 @@ def test_unknown_route_returns_404(make_client):
     response = client.get("/nope")
 
     assert response.status_code == 404
-    assert response.json() == {"error": "no matching route", "path": "/nope"}
+    assert response.json() == {
+        "error": "no matching route",
+        "path": "/nope",
+        "request_id": response.headers["x-request-id"],
+    }
 
 
 def test_upstream_error_status_passes_through(make_client):
@@ -138,7 +142,10 @@ def test_upstream_timeout_returns_504(make_client):
     response = client.get("/api/slow")
 
     assert response.status_code == 504
-    assert response.json() == {"error": "upstream timeout"}
+    assert response.json() == {
+        "error": "upstream timeout",
+        "request_id": response.headers["x-request-id"],
+    }
 
 
 def test_upstream_unreachable_returns_502(make_client):
@@ -149,4 +156,7 @@ def test_upstream_unreachable_returns_502(make_client):
     response = client.get("/api/x")
 
     assert response.status_code == 502
-    assert response.json() == {"error": "upstream unavailable"}
+    assert response.json() == {
+        "error": "upstream unavailable",
+        "request_id": response.headers["x-request-id"],
+    }

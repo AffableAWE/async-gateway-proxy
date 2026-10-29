@@ -13,6 +13,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
 from app.config import RouteConfig
+from app.request_context import get_request_id
 from app.router import build_upstream_url
 
 logger = logging.getLogger("gateway.proxy")
@@ -74,16 +75,30 @@ def _forwarded_headers(request: Request) -> list[tuple[str, str]]:
     # Append to an existing X-Forwarded-For chain instead of overwriting it,
     # so the upstream can see every proxy the request passed through.
     prior = request.headers.get("x-forwarded-for")
-    headers = [(k, v) for k, v in headers if k.lower() != "x-forwarded-for"]
+    # The gateway sets these itself, so drop whatever the client sent.
+    replaced = {"x-forwarded-for", "x-request-id"}
+    headers = [(k, v) for k, v in headers if k.lower() not in replaced]
+
     headers.append(("x-forwarded-for", f"{prior}, {client_ip}" if prior else client_ip))
     headers.append(("x-forwarded-proto", request.url.scheme))
     if "host" in request.headers:
         headers.append(("x-forwarded-host", request.headers["host"]))
+
+    # Same ID the gateway logs and returns to the client. If the upstream
+    # logs it too, one ID finds the request on both sides.
+    request_id = get_request_id()
+    if request_id is not None:
+        headers.append(("x-request-id", request_id))
     return headers
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"error": message})
+    # The ID in the body lets a client quote it in a bug report, even if
+    # whatever it uses to call us hides response headers.
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": message, "request_id": get_request_id()},
+    )
 
 
 async def forward_request(
@@ -109,6 +124,9 @@ async def forward_request(
     )
 
     log_fields = {"method": request.method, "path": request.url.path, "upstream": upstream_url}
+    # upstream_ms below is time spent waiting on the upstream only. The
+    # access log's duration_ms is the whole request. The gap between the
+    # two is the gateway's own overhead.
     start = time.perf_counter()  # monotonic: safe for measuring durations
 
     try:
@@ -128,7 +146,7 @@ async def forward_request(
             "upstream_timeout",
             extra={
                 **log_fields,
-                "latency_ms": _ms_since(start),
+                "upstream_ms": _ms_since(start),
                 "error_type": type(exc).__name__,
                 "timeout_seconds": timeout_seconds,
             },
@@ -141,7 +159,7 @@ async def forward_request(
             "upstream_unreachable",
             extra={
                 **log_fields,
-                "latency_ms": _ms_since(start),
+                "upstream_ms": _ms_since(start),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
             },
@@ -153,7 +171,8 @@ async def forward_request(
         extra={
             **log_fields,
             "status_code": upstream_response.status_code,
-            "latency_ms": _ms_since(start),
+            "upstream_ms": _ms_since(start),
+            "request_bytes": len(body),
             "response_bytes": len(content),
         },
     )
