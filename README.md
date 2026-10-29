@@ -8,7 +8,8 @@ the backend's response. It is built to sit in front of a custom multithreaded
 C++ HTTP server.
 
 The project is built in phases. This README describes what exists now
-(Phase 1: the core proxy). Later phases are listed under [Roadmap](#roadmap).
+(up to Phase 2: core proxy plus request tracing). Later phases are listed
+under [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -18,14 +19,18 @@ What happens to one request:
 
 1. Uvicorn accepts the TCP connection, parses the HTTP request and hands it
    to FastAPI as an ASGI call.
-2. `/health` is answered directly. Every other path hits one catch-all route.
-3. `router.py` finds the longest `path_prefix` that matches the path. No
+2. The request ID middleware gives the request an ID (the client's own
+   `X-Request-ID` if it is well formed, a new UUID if not). Every log line
+   for this request carries that ID.
+3. `/health` is answered directly. Every other path hits one catch-all route.
+4. `router.py` finds the longest `path_prefix` that matches the path. No
    match means `404`.
-4. `proxy.py` builds the upstream URL (prefix removed, query string kept as
-   sent), cleans the headers, and sends the request through a single shared
-   `httpx.AsyncClient`.
-5. The upstream's status, headers and body go back to the client. A timeout
-   becomes `504`; a connection failure becomes `502`.
+5. `proxy.py` builds the upstream URL (prefix removed, query string kept as
+   sent), cleans the headers, adds `X-Request-ID`, and sends the request
+   through a single shared `httpx.AsyncClient`.
+6. The upstream's status, headers and body go back to the client with the
+   same `X-Request-ID`. A timeout becomes `504`; a connection failure
+   becomes `502`. One `request_completed` line is logged at the end.
 
 Everything is async. While one request waits on its upstream, the event loop
 serves other requests on the same thread.
@@ -41,7 +46,8 @@ serves other requests on the same thread.
 - **Header handling per RFC 7230:** hop-by-hop headers are dropped in both
   directions, including any header named in `Connection`. `Host` and
   `Content-Length` are set fresh for the upstream. `X-Forwarded-For` is
-  appended to, never overwritten. The gateway adds no headers of its own.
+  appended to, never overwritten. Apart from the `X-Forwarded-*` and
+  `X-Request-ID` headers, the gateway adds nothing of its own.
 - **Bodies pass through untouched.** A gzipped upstream response reaches the
   client still gzipped, with its `Content-Encoding` intact. Repeated headers
   such as `Set-Cookie` are kept.
@@ -49,8 +55,15 @@ serves other requests on the same thread.
   process, so keep-alive connections to each upstream are reused.
 - **Distinct failure codes.** `504` for upstream timeout, `502` for an
   unreachable upstream, upstream `5xx` passed through as is.
-- **Structured JSON logs.** One line per request with method, path,
-  upstream URL, status, latency and response size.
+- **Request IDs end to end.** Each request gets an ID that appears in every
+  log line, goes to the upstream as `X-Request-ID`, comes back to the client
+  in the response header and in error bodies. A client's own ID is kept if
+  it is 1 to 128 characters of letters, digits and `. _ : -`; anything else
+  is replaced.
+- **Structured JSON logs.** A `request_completed` line for every request
+  (total `duration_ms`) and a `proxy_forward` line for every forwarded one
+  (`upstream_ms`, request and response sizes). The gap between the two
+  times is the gateway's own overhead.
 
 ## Project layout
 
@@ -59,7 +72,10 @@ app/
   main.py            app factory, lifespan, /health, catch-all route
   router.py          route matching and upstream URL building (pure functions)
   proxy.py           forwarding, header filtering, error mapping
-  logging_config.py  JSON log formatter
+  logging_config.py  JSON log formatter, request ID on every record
+  request_context.py ContextVar holding the current request ID
+  middleware/
+    request_id.py    assigns the ID, sets the response header, access log
   config/
     models.py        Pydantic schema for config.yaml
     loader.py        reads and validates the YAML file
@@ -90,8 +106,8 @@ Why the two flags:
 - `--no-proxy-headers`: by default Uvicorn trusts `X-Forwarded-For` from
   localhost and rewrites the client address from it. The gateway is the edge,
   so it must record the real TCP peer, not a value the caller can fake.
-- `--no-access-log`: the gateway writes its own JSON line for every proxied
-  request, so Uvicorn's access log would only duplicate it.
+- `--no-access-log`: the gateway writes its own `request_completed` JSON
+  line for every request, so Uvicorn's access log would only duplicate it.
 
 Environment variables:
 
@@ -133,20 +149,31 @@ curl -X POST localhost:8000/api/echo \
   -H "Content-Type: application/json" \
   -d '{"hello":"world"}'
 
+# Your own request ID is kept, sent upstream, and returned
+curl -i localhost:8000/api/echo -H "X-Request-ID: demo-42"
+# x-request-id: demo-42   (and "x-request-id": "demo-42" in the echoed headers)
+
 # No matching route
 curl -i localhost:8000/nope
-# 404 {"error":"no matching route","path":"/nope"}
+# 404 {"error":"no matching route","path":"/nope","request_id":"f046eddc-..."}
+
+# A real timeout: the upstream waits 6 s, the gateway gives up after 5 s
+curl -i "localhost:8000/api/slow?delay=6"
+# 504 {"error":"upstream timeout","request_id":"..."}
 
 # Stop the dummy upstream, then:
 curl -i localhost:8000/api/items/1
-# 502 {"error":"upstream unavailable"}
+# 502 {"error":"upstream unavailable","request_id":"..."}
 ```
 
-A log line for a proxied request:
+The two log lines for one proxied request share its ID:
 
 ```json
-{"ts": "2026-10-27T16:27:40.171+00:00", "level": "info", "logger": "gateway.proxy", "message": "proxy_forward", "method": "GET", "path": "/api/echo", "upstream": "http://localhost:8001/echo", "status_code": 200, "latency_ms": 1.84, "response_bytes": 247}
+{"ts": "2026-10-29T13:32:13.341+00:00", "level": "info", "logger": "gateway.proxy", "message": "proxy_forward", "request_id": "da5f233a-8b9c-4520-bce7-019b955a2de7", "method": "GET", "path": "/api/items/7", "upstream": "http://localhost:8001/items/7", "status_code": 200, "upstream_ms": 34.38, "request_bytes": 0, "response_bytes": 29}
+{"ts": "2026-10-29T13:32:13.342+00:00", "level": "info", "logger": "gateway.access", "message": "request_completed", "request_id": "da5f233a-8b9c-4520-bce7-019b955a2de7", "method": "GET", "path": "/api/items/7", "status_code": 200, "duration_ms": 35.71, "client_ip": "127.0.0.1"}
 ```
+
+To find everything about one request: `grep da5f233a gateway.log`.
 
 ## Tests
 
@@ -157,10 +184,11 @@ ruff check . && ruff format --check .
 
 The proxy tests swap httpx's network transport for `httpx.MockTransport`,
 so they cover forwarding, header rules, gzip passthrough, timeouts and
-connection failures without opening a socket. CI runs lint and tests on
+connection failures without opening a socket. One test runs 20 requests
+concurrently and checks that none of them logs another's request ID. CI runs lint and tests on
 Python 3.12, 3.13 and 3.14 for every push.
 
-## Limitations (Phase 1)
+## Limitations
 
 - Request and response bodies are read fully into memory. Large uploads,
   downloads and server-sent events need streaming (Phase 6).
@@ -171,13 +199,17 @@ Python 3.12, 3.13 and 3.14 for every push.
   deadline for the request.
 - One upstream URL per route, so no load balancing across replicas.
 - HTTP only. TLS is expected to end at an ingress in front of the gateway.
+- Any client's well-formed `X-Request-ID` is trusted. A production edge
+  proxy would usually trust it only from known internal callers.
+- Request IDs are not full distributed tracing: there are no spans or
+  parent/child timings. OpenTelemetry would add that.
 
 ## Roadmap
 
 | Phase | Adds |
 |-------|------|
-| 1     | Core proxy, config, logging, tests, CI (this release) |
-| 2     | Request IDs propagated to upstreams and logs |
+| 1     | Core proxy, config, logging, tests, CI (done) |
+| 2     | Request IDs propagated to upstreams and logs (done) |
 | 3     | API key authentication with per-key route access |
 | 4     | Token-bucket rate limiting (in-memory, then Redis) |
 | 5     | Retries with backoff and jitter, retry budget, circuit breaker |
