@@ -6,7 +6,9 @@ Run it on its own port and point a route at it:
 It stands in for your C++ server: HTTP in, HTTP out.
 """
 
-from fastapi import FastAPI, Request
+import asyncio
+
+from fastapi import FastAPI, Query, Request
 
 app = FastAPI(title="dummy-upstream")
 
@@ -34,3 +36,15 @@ async def echo(request: Request) -> dict:
         "headers": dict(request.headers),
         "body": body.decode(errors="replace"),
     }
+
+
+@app.get("/slow")
+async def slow(delay: float = Query(2.0, ge=0, le=30)) -> dict:
+    """Waits `delay` seconds, then answers. Lets you trigger a real 504:
+    with the gateway's 5 s timeout, /api/slow?delay=6 times out.
+
+    asyncio.sleep, not time.sleep: time.sleep would block this server's
+    event loop, and every other request to it would stall too.
+    """
+    await asyncio.sleep(delay)
+    return {"slept_seconds": delay}
