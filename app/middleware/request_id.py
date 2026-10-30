@@ -70,15 +70,18 @@ class RequestIDMiddleware:
         try:
             await self.app(scope, receive, send_with_id)
         finally:
-            client = scope.get("client")
-            logger.info(
-                "request_completed",
-                extra={
-                    "method": scope["method"],
-                    "path": scope["path"],
-                    "status_code": status_code,
-                    "duration_ms": round((time.perf_counter() - start) * 1000, 2),
-                    "client_ip": client[0] if client else None,
-                },
-            )
+            peer = scope.get("client")
+            fields = {
+                "method": scope["method"],
+                "path": scope["path"],
+                "status_code": status_code,
+                "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                "client_ip": peer[0] if peer else None,
+            }
+            # Set by the auth middleware, which runs inside this one and
+            # shares the same scope dict.
+            api_client = scope.get("state", {}).get("api_client")
+            if api_client is not None:
+                fields["client"] = api_client.client
+            logger.info("request_completed", extra=fields)
             request_id_var.reset(token)

@@ -160,3 +160,15 @@ def test_upstream_unreachable_returns_502(make_client):
         "error": "upstream unavailable",
         "request_id": response.headers["x-request-id"],
     }
+
+
+def test_with_auth_off_the_api_key_header_passes_through(make_client):
+    # The default test config has no auth section. The gateway then doesn't
+    # own X-API-Key, so it must not eat a key meant for the upstream.
+    response = make_client(echo).get("/api/x", headers={"X-API-Key": "for-upstream"})
+    assert response.json()["headers"]["x-api-key"] == "for-upstream"
+
+
+def test_with_auth_off_a_client_cannot_fake_gateway_identity(make_client):
+    response = make_client(echo).get("/api/x", headers={"X-Gateway-Client": "admin"})
+    assert "x-gateway-client" not in response.json()["headers"]

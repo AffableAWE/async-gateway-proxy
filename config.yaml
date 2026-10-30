@@ -13,3 +13,13 @@ routes:
   # Your C++ HTTP server. Uncomment and set the port it listens on.
   # - path_prefix: /cpp
   #   upstream: http://localhost:8080
+
+# API keys. Remove this whole section to turn auth off.
+# Make a real key with:  python -m app.security <client-name> --routes /api
+auth:
+  keys:
+    # LOCAL DEVELOPMENT ONLY. The key is "gw_dev_local_only" and it is
+    # public (it's in the README). Delete this entry before deploying.
+    - client: local-dev
+      key_sha256: 1968b31589e9aad4699d926451a0cfc1a08d73878937987a8e2e3563a04f8193
+      routes: [/api]

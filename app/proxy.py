@@ -76,7 +76,14 @@ def _forwarded_headers(request: Request) -> list[tuple[str, str]]:
     # so the upstream can see every proxy the request passed through.
     prior = request.headers.get("x-forwarded-for")
     # The gateway sets these itself, so drop whatever the client sent.
-    replaced = {"x-forwarded-for", "x-request-id"}
+    # x-gateway-client is dropped even with auth off: otherwise a caller
+    # could claim to be any client the upstream trusts.
+    replaced = {"x-forwarded-for", "x-request-id", "x-gateway-client"}
+    api_client = getattr(request.state, "api_client", None)
+    if api_client is not None:
+        # The client's key is for the gateway only. Passing it on would
+        # hand a live secret to every upstream and its logs.
+        replaced.add("x-api-key")
     headers = [(k, v) for k, v in headers if k.lower() not in replaced]
 
     headers.append(("x-forwarded-for", f"{prior}, {client_ip}" if prior else client_ip))
@@ -89,6 +96,11 @@ def _forwarded_headers(request: Request) -> list[tuple[str, str]]:
     request_id = get_request_id()
     if request_id is not None:
         headers.append(("x-request-id", request_id))
+
+    # Tells the upstream who is calling, checked by the gateway. Upstreams
+    # can trust it only because the gateway strips any client-sent copy.
+    if api_client is not None:
+        headers.append(("x-gateway-client", api_client.client))
     return headers
 
 

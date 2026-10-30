@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import GatewayConfig, load_config
 from app.logging_config import setup_logging
+from app.middleware.auth import AuthMiddleware
 from app.middleware.request_id import RequestIDMiddleware
 from app.proxy import forward_request
 from app.request_context import get_request_id
@@ -59,13 +60,18 @@ def create_app(
         # Accept-Encoding could get it a gzipped body it can't read.
         app.state.http_client.headers.clear()
 
+        auth = app.state.config.auth
         logger.info(
             "gateway_startup",
             extra={
                 "config_source": "injected" if config is not None else config_path,
                 "routes": [r.path_prefix for r in app.state.config.routes],
+                "auth": "on" if auth is not None else "off",
+                "api_keys": len(auth.keys) if auth is not None else 0,
             },
         )
+        if auth is None:
+            logger.warning("auth_disabled", extra={"hint": "add an auth section to config.yaml"})
         try:
             yield
         finally:
@@ -76,9 +82,10 @@ def create_app(
     # should be proxied like any other path, not answered by FastAPI.
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
-    # Middleware order: the last one added runs first (outermost). The
-    # request ID must be outermost so that auth and rate-limit rejections
-    # added in later phases are logged with an ID too.
+    # Middleware order: the LAST one added runs FIRST (outermost). So a
+    # request passes RequestID -> Auth -> routing. Request ID stays
+    # outermost, so even a 401 is logged with an ID.
+    app.add_middleware(AuthMiddleware)
     app.add_middleware(RequestIDMiddleware)
 
     @app.get("/health")
@@ -107,6 +114,27 @@ def create_app(
                 content={
                     "error": "no matching route",
                     "path": request.url.path,
+                    "request_id": get_request_id(),
+                },
+            )
+
+        # Authorization. Auth middleware already proved who the caller is;
+        # now that the route is known, check the key may use it.
+        api_client = getattr(request.state, "api_client", None)
+        if api_client is not None and route.path_prefix not in api_client.routes:
+            logger.warning(
+                "access_denied",
+                extra={
+                    "client": api_client.client,
+                    "route": route.path_prefix,
+                    "method": request.method,
+                    "path": request.url.path,
+                },
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "api key not allowed for this route",
                     "request_id": get_request_id(),
                 },
             )
