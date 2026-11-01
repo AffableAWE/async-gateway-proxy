@@ -25,3 +25,19 @@ def test_slow_answers_after_the_delay():
 def test_slow_rejects_out_of_range_delays():
     assert client.get("/slow?delay=31").status_code == 422
     assert client.get("/slow?delay=-1").status_code == 422
+
+
+def test_flaky_fails_then_succeeds():
+    codes = [client.get("/flaky?key=t1&fail=2").status_code for _ in range(4)]
+    assert codes == [503, 503, 200, 200]
+
+
+def test_flaky_keys_are_independent():
+    client.get("/flaky?key=t2&fail=1")
+    assert client.get("/flaky?key=t3&fail=1").status_code == 503
+
+
+def test_status_returns_the_code():
+    assert client.get("/status/503").status_code == 503
+    assert client.get("/status/204").status_code == 204
+    assert client.get("/status/99").status_code == 400
