@@ -8,8 +8,8 @@ the backend's response. It is built to sit in front of a custom multithreaded
 C++ HTTP server.
 
 The project is built in phases. This README describes what exists now
-(up to Phase 3: core proxy, request tracing and API key auth). Later phases
-are listed under [Roadmap](#roadmap).
+(up to Phase 4: core proxy, request tracing, API key auth and rate
+limiting). Later phases are listed under [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -24,14 +24,16 @@ What happens to one request:
    for this request carries that ID.
 3. The auth middleware checks the `X-API-Key` header. No key or an unknown
    key means `401`. `/health` needs no key.
-4. `/health` is answered directly. Every other path hits one catch-all route.
-5. `router.py` finds the longest `path_prefix` that matches the path. No
+4. The rate limit middleware takes one token from the client's bucket. An
+   empty bucket means `429` with `Retry-After`.
+5. `/health` is answered directly. Every other path hits one catch-all route.
+6. `router.py` finds the longest `path_prefix` that matches the path. No
    match means `404`. If the key isn't allowed on that route, `403`.
-6. `proxy.py` builds the upstream URL (prefix removed, query string kept as
+7. `proxy.py` builds the upstream URL (prefix removed, query string kept as
    sent), cleans the headers (the API key is removed), adds `X-Request-ID`
    and `X-Gateway-Client`, and sends the request through a single shared
    `httpx.AsyncClient`.
-7. The upstream's status, headers and body go back to the client with the
+8. The upstream's status, headers and body go back to the client with the
    same `X-Request-ID`. A timeout becomes `504`; a connection failure
    becomes `502`. One `request_completed` line is logged at the end.
 
@@ -69,6 +71,11 @@ serves other requests on the same thread.
   stripped before forwarding; the upstream gets the verified client name in
   `X-Gateway-Client` instead, and a client-sent copy of that header is
   always dropped. A client can hold two keys at once for rotation.
+- **Rate limiting.** A token bucket per client (per IP with auth off),
+  with a default and optional per-client limits. Buckets live in memory
+  for one process, or in Redis so every gateway process and replica shares
+  them. The Redis check is one atomic Lua script. If Redis goes down the
+  gateway fails open by default, or closed if configured.
 - **Structured JSON logs.** A `request_completed` line for every request
   (total `duration_ms`) and a `proxy_forward` line for every forwarded one
   (`upstream_ms`, request and response sizes). The gap between the two
@@ -87,6 +94,11 @@ app/
   middleware/
     request_id.py    assigns the ID, sets the response header, access log
     auth.py          checks X-API-Key (authentication)
+    rate_limit.py    token bucket check per client, 429 and limit headers
+  ratelimit/
+    base.py          the token bucket algorithm
+    memory.py        buckets in this process
+    redis_backend.py buckets in Redis, shared, via a Lua script
   config/
     models.py        Pydantic schema for config.yaml
     loader.py        reads and validates the YAML file
@@ -192,6 +204,76 @@ Design choices:
 - **Rotation.** List a second key for the same client, move the client to
   it, then delete the old entry.
 
+## Rate limiting
+
+```yaml
+rate_limit:
+  backend: memory          # memory (one process) or redis (shared)
+  default:
+    capacity: 20           # biggest burst
+    refill_per_second: 10  # long-run average rate
+  # backend: redis
+  # redis_url: redis://localhost:6379/0
+  # redis_timeout_seconds: 0.25
+  # fail_open: true        # Redis down: allow (true) or 429 (false)
+
+auth:
+  keys:
+    - client: batch-job
+      key_sha256: ...
+      routes: [/api]
+      rate_limit:          # optional, overrides the default for this client
+        capacity: 100
+        refill_per_second: 50
+```
+
+Every limited response carries `X-RateLimit-Limit` and
+`X-RateLimit-Remaining`. Over the limit:
+
+```
+HTTP/1.1 429 Too Many Requests
+retry-after: 1
+x-ratelimit-limit: 20
+x-ratelimit-remaining: 0
+
+{"error":"rate limit exceeded","request_id":"..."}
+```
+
+Design choices:
+
+- **Token bucket, not a fixed window.** "100 per minute" lets a client send
+  100 at 0:59 and 100 more at 1:00. A bucket has no window edges, so a burst
+  is never more than `capacity`.
+- **Lazy refill.** Nothing ticks in the background. A bucket stores its
+  tokens and when it was last touched, and adds what it earned on the next
+  request. One O(1) check per request.
+- **After auth.** The limiter needs to know who is calling. Requests that
+  fail auth never reach it, so they don't drain anyone's bucket.
+- **Per client, not per key.** A client's two keys during a rotation share
+  one bucket instead of doubling its limit.
+- **Why Redis.** In-memory buckets are per process: three replicas each
+  allow the full limit, so a client gets three times its limit. Redis gives
+  every replica the same buckets.
+- **Atomic Lua script.** Done from Python as GET, compute, SET, two
+  replicas can both read "1 token left". Against a real Redis, a naive
+  GET/SET version let 50 of 50 concurrent requests through a limit of 10;
+  the Lua script let through exactly 10. Redis runs a script without
+  interleaving other commands.
+- **Redis's clock.** The script uses Redis `TIME`, so replicas with
+  slightly different clocks can't hand out extra tokens.
+- **Keys expire.** Each bucket key expires once it would be full again; an
+  idle client costs nothing in Redis.
+- **Fail open by default.** If Redis is unreachable, requests go through
+  and one error is logged every 10 s. Rate limiting protects the backends,
+  but taking the whole API down because the limiter is down is usually
+  worse. Set `fail_open: false` to reject with 429 instead.
+
+Redis locally:
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine   # or: brew install redis && redis-server
+```
+
 ## Try it
 
 The bundled `config.yaml` has one key for local development only:
@@ -231,6 +313,11 @@ curl -i localhost:8000/api/echo -H "$K" -H "X-Request-ID: demo-42"
 curl -i localhost:8000/nope -H "$K"
 # 404 {"error":"no matching route","path":"/nope","request_id":"f046eddc-..."}
 
+# Rate limit: the dev config allows a burst of 20, then 10/s
+for i in $(seq 25); do curl -s -o /dev/null -w "%{http_code} " localhost:8000/api/items/1 -H "$K"; done; echo
+# 200 x22 or so, then 429s: 20 from the burst, plus a few that refilled
+# (10/s) while the loop ran
+
 # A real timeout: the upstream waits 6 s, the gateway gives up after 5 s
 curl -i "localhost:8000/api/slow?delay=6" -H "$K"
 # 504 {"error":"upstream timeout","request_id":"..."}
@@ -268,14 +355,30 @@ so they cover forwarding, header rules, gzip passthrough, timeouts and
 connection failures without opening a socket. One test runs 20 requests
 concurrently and checks that none of them logs another's request ID. The
 auth tests cover each response code, key stripping, identity spoofing and
-key rotation. CI runs lint and tests on Python 3.12, 3.13 and 3.14 for
-every push.
+key rotation. Rate limit tests use a fake clock, so refill is exact and
+instant.
+
+The Redis limiter tests run against fakeredis, which runs the real Lua
+script in-process, so they need no Redis. With `REDIS_URL` set they also
+run against a real server:
+
+```bash
+REDIS_URL=redis://localhost:6379/0 pytest
+```
+
+CI runs lint and tests on Python 3.12, 3.13 and 3.14 for every push, with a
+real Redis service container.
 
 ## Limitations
 
 - Request and response bodies are read fully into memory. Large uploads,
   downloads and server-sent events need streaming (Phase 6).
-- No rate limiting, retries or circuit breaking yet.
+- No retries or circuit breaking yet.
+- Requests that fail auth are not rate limited, so a flood of bad keys
+  still costs a hash and a log line each. A production edge would add a
+  per-IP limit in front of auth.
+- One token per request regardless of cost; a 10 MB upload costs the same
+  as a health check.
 - API keys don't expire and can't be revoked without a restart (hot reload
   comes in Phase 7). Key hashes live in the config file; in Kubernetes
   (Phase 10) they move to a Secret.
@@ -299,7 +402,7 @@ every push.
 | 1     | Core proxy, config, logging, tests, CI (done) |
 | 2     | Request IDs propagated to upstreams and logs (done) |
 | 3     | API key authentication with per-key route access (done) |
-| 4     | Token-bucket rate limiting (in-memory, then Redis) |
+| 4     | Token-bucket rate limiting (in-memory, then Redis) (done) |
 | 5     | Retries with backoff and jitter, retry budget, circuit breaker |
 | 6     | Streaming bodies and graceful shutdown |
 | 7     | Readiness probe, Prometheus metrics, config hot reload |
