@@ -8,8 +8,9 @@ the backend's response. It is built to sit in front of a custom multithreaded
 C++ HTTP server.
 
 The project is built in phases. This README describes what exists now
-(up to Phase 4: core proxy, request tracing, API key auth and rate
-limiting). Later phases are listed under [Roadmap](#roadmap).
+(up to Phase 5: core proxy, request tracing, API key auth, rate limiting,
+retries and circuit breaking). Later phases are listed under
+[Roadmap](#roadmap).
 
 ## Architecture
 
@@ -32,7 +33,9 @@ What happens to one request:
 7. `proxy.py` builds the upstream URL (prefix removed, query string kept as
    sent), cleans the headers (the API key is removed), adds `X-Request-ID`
    and `X-Gateway-Client`, and sends the request through a single shared
-   `httpx.AsyncClient`.
+   `httpx.AsyncClient`. If the upstream's circuit breaker is open, it fails
+   fast with `503` instead. A failed attempt that is safe to retry is tried
+   again after a random backoff, while the retry budget allows.
 8. The upstream's status, headers and body go back to the client with the
    same `X-Request-ID`. A timeout becomes `504`; a connection failure
    becomes `502`. One `request_completed` line is logged at the end.
@@ -76,6 +79,12 @@ serves other requests on the same thread.
   for one process, or in Redis so every gateway process and replica shares
   them. The Redis check is one atomic Lua script. If Redis goes down the
   gateway fails open by default, or closed if configured.
+- **Retries.** Safe failures are retried with exponential backoff and full
+  jitter: connect failures for any method, `502`/`503`/`504` and broken
+  connections only for idempotent methods, timeouts never. A per-upstream
+  retry budget caps retries at 20% of recent traffic.
+- **Circuit breakers.** One per upstream. After 5 failures in a row the
+  gateway answers `503` at once for 10 s, then lets one probe through.
 - **Structured JSON logs.** A `request_completed` line for every request
   (total `duration_ms`) and a `proxy_forward` line for every forwarded one
   (`upstream_ms`, request and response sizes). The gap between the two
@@ -99,6 +108,10 @@ app/
     base.py          the token bucket algorithm
     memory.py        buckets in this process
     redis_backend.py buckets in Redis, shared, via a Lua script
+  resilience/
+    retry.py         what to retry, backoff with jitter, retry budget
+    breaker.py       circuit breaker state machine
+    guards.py        one budget and one breaker per upstream
   config/
     models.py        Pydantic schema for config.yaml
     loader.py        reads and validates the YAML file
@@ -274,6 +287,75 @@ Redis locally:
 docker run --rm -p 6379:6379 redis:7-alpine   # or: brew install redis && redis-server
 ```
 
+## Retries and circuit breaking
+
+```yaml
+retries:
+  max_attempts: 3               # total, including the first try
+  base_delay_seconds: 0.05
+  max_delay_seconds: 1.0
+  budget_ratio: 0.2             # retries <= 20% of recent requests per upstream
+  budget_min_per_second: 1.0    # ...plus a small floor for quiet upstreams
+
+circuit_breaker:
+  failure_threshold: 5          # failures in a row before opening
+  recovery_timeout_seconds: 10  # open this long, then one probe
+```
+
+Remove a section to turn that feature off.
+
+**What gets retried:**
+
+| Failure                                   | GET, HEAD, OPTIONS, PUT, DELETE | POST, PATCH |
+|-------------------------------------------|---------------------------------|-------------|
+| Connect failed (refused, DNS, connect timeout) | retried                    | retried     |
+| Upstream answered `502`/`503`/`504`       | retried                         | no          |
+| Connection broke after sending            | retried                         | no          |
+| Read timeout                              | no                              | no          |
+| Upstream answered `500` or `4xx`          | no                              | no          |
+
+Design choices:
+
+- **Retry only what is safe.** If the connection never opened, the request
+  was never sent, so even a POST can go again. Once it was sent, the
+  upstream may have acted on it, so only idempotent methods are retried; a
+  retried `POST /payments` could charge a card twice.
+- **No retry on timeouts.** A slow upstream is usually an overloaded one.
+  Retrying adds load and multiplies the client's wait by the attempt count.
+- **No retry on 500.** It usually means a bug that will fail the same way.
+- **Full jitter.** Each wait is random between 0 and `base × 2^n` (capped).
+  Fixed delays make clients that failed together retry together, and knock
+  the upstream over again.
+- **Retry budget.** Without one, every request retrying twice turns a
+  struggling upstream's traffic into 3x, and it never recovers (a retry
+  storm). Retries per upstream stay under 20% of the last 10 s of requests.
+- **Circuit breaker per upstream.** Once an upstream has failed 5 times in a
+  row, waiting on it is pointless. The gateway answers `503` with
+  `Retry-After` in about a millisecond, the upstream gets room to recover,
+  and after the timeout one probe request decides whether to close again.
+  Other upstreams are unaffected.
+- **Breaker and retries together.** Each attempt counts towards the
+  breaker. When an attempt opens it, retrying stops at once, without
+  waiting out the backoff.
+- **The final answer.** If retries run out on a `503`, the client gets the
+  upstream's own `503` body, which says more than a gateway error would.
+
+What it looks like (dummy upstream killed after a few `503`s, then
+restarted):
+
+```
+upstream_retry        /api/flaky   attempt 1  reason status  503  delay 18 ms
+upstream_retry        /api/flaky   attempt 2  reason status  503  delay 90 ms
+proxy_forward         /api/flaky   200  attempts 3
+...
+circuit_state_change  closed -> open
+upstream_unreachable  /api/items/1  attempts 2  ConnectError
+circuit_open_rejected /api/items/1  retry_after_s 10       (answered in 1 ms)
+circuit_state_change  open -> half_open
+circuit_state_change  half_open -> closed
+proxy_forward         /api/items/1  200  attempts 1
+```
+
 ## Try it
 
 The bundled `config.yaml` has one key for local development only:
@@ -318,13 +400,25 @@ for i in $(seq 25); do curl -s -o /dev/null -w "%{http_code} " localhost:8000/ap
 # 200 x22 or so, then 429s: 20 from the burst, plus a few that refilled
 # (10/s) while the loop ran
 
+# Retries: this upstream endpoint fails twice, then succeeds.
+# The client only sees the 200; the log shows two upstream_retry lines.
+curl "localhost:8000/api/flaky?key=demo1&fail=2" -H "$K"
+# {"ok": true, "call": 3}
+
+# Retries run out: 3 attempts, then the upstream's own 503
+curl -i localhost:8000/api/status/503 -H "$K"
+
 # A real timeout: the upstream waits 6 s, the gateway gives up after 5 s
 curl -i "localhost:8000/api/slow?delay=6" -H "$K"
 # 504 {"error":"upstream timeout","request_id":"..."}
 
-# Stop the dummy upstream, then:
+# Circuit breaker: stop the dummy upstream, then repeat this a few times.
+# The first requests retry and fail with 502; once 5 attempts in a row have
+# failed the breaker opens, and the rest get 503 in about a millisecond.
+# Restart the upstream, wait 10 s, and requests succeed again.
 curl -i localhost:8000/api/items/1 -H "$K"
-# 502 {"error":"upstream unavailable","request_id":"..."}
+# first:  502 {"error":"upstream unavailable","request_id":"..."}
+# later:  503 {"error":"upstream circuit open","request_id":"..."}  retry-after: 10
 ```
 
 The two log lines for one proxied request share its ID, and the access line
@@ -373,7 +467,13 @@ real Redis service container.
 
 - Request and response bodies are read fully into memory. Large uploads,
   downloads and server-sent events need streaming (Phase 6).
-- No retries or circuit breaking yet.
+- Circuit breakers and retry budgets live in each gateway process. Three
+  replicas each learn about a dead upstream on their own (5 failed requests
+  each), which is usually fine.
+- `upstream_timeout_seconds` is per attempt. A request that retries can
+  take up to `max_attempts` times longer; there is no overall deadline.
+- `Retry-After` from an upstream's 503 is not honoured; the gateway uses
+  its own backoff.
 - Requests that fail auth are not rate limited, so a flood of bad keys
   still costs a hash and a log line each. A production edge would add a
   per-IP limit in front of auth.
@@ -403,7 +503,7 @@ real Redis service container.
 | 2     | Request IDs propagated to upstreams and logs (done) |
 | 3     | API key authentication with per-key route access (done) |
 | 4     | Token-bucket rate limiting (in-memory, then Redis) (done) |
-| 5     | Retries with backoff and jitter, retry budget, circuit breaker |
+| 5     | Retries with backoff and jitter, retry budget, circuit breaker (done) |
 | 6     | Streaming bodies and graceful shutdown |
 | 7     | Readiness probe, Prometheus metrics, config hot reload |
 | 8     | Docker and docker-compose (gateway, upstream, C++ server, Redis, Prometheus) |
