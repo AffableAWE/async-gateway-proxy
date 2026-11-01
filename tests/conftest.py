@@ -56,9 +56,9 @@ def make_client(config):
     """
     clients = []
 
-    def _make(handler) -> TestClient:
+    def _make(handler, **app_kwargs) -> TestClient:
         transport = httpx.MockTransport(_like_network(handler))
-        app = create_app(config=config, transport=transport)
+        app = create_app(config=config, transport=transport, **app_kwargs)
         client = TestClient(app)
         client.__enter__()  # runs the lifespan startup
         clients.append(client)

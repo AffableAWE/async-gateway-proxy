@@ -172,3 +172,10 @@ def test_with_auth_off_the_api_key_header_passes_through(make_client):
 def test_with_auth_off_a_client_cannot_fake_gateway_identity(make_client):
     response = make_client(echo).get("/api/x", headers={"X-Gateway-Client": "admin"})
     assert "x-gateway-client" not in response.json()["headers"]
+
+
+def test_without_a_rate_limit_section_nothing_is_limited(make_client):
+    client = make_client(echo)
+    responses = [client.get("/api/x") for _ in range(50)]
+    assert all(r.status_code == 200 for r in responses)
+    assert "x-ratelimit-limit" not in responses[-1].headers

@@ -23,3 +23,16 @@ auth:
     - client: local-dev
       key_sha256: 1968b31589e9aad4699d926451a0cfc1a08d73878937987a8e2e3563a04f8193
       routes: [/api]
+
+# Rate limiting: a token bucket per client (per IP when auth is off).
+# capacity = biggest burst, refill_per_second = long-run average rate.
+# Remove this whole section to turn rate limiting off.
+rate_limit:
+  backend: memory               # one process; use redis for several
+  default:
+    capacity: 20
+    refill_per_second: 10
+  # Shared buckets for several gateway processes or replicas:
+  # backend: redis
+  # redis_url: redis://localhost:6379/0
+  # fail_open: true             # Redis down: allow (true) or 429 (false)

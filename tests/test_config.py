@@ -150,3 +150,79 @@ def test_one_client_may_have_two_keys_for_rotation():
         )
     )
     assert [k.client for k in config.auth.keys] == ["web", "web"]
+
+
+# --- rate limit ------------------------------------------------------------
+
+
+def with_rate_limit(default, key_limit=None):
+    entry = {"client": "web", "key_sha256": HASH, "routes": ["/api"]}
+    if key_limit is not None:
+        entry["rate_limit"] = key_limit
+    return {**with_auth([entry]), "rate_limit": {"default": default}}
+
+
+def test_rate_limit_is_off_when_the_section_is_missing():
+    config = GatewayConfig.model_validate(
+        with_auth([{"client": "w", "key_sha256": HASH, "routes": ["/api"]}])
+    )
+    assert config.rate_limit is None
+
+
+def test_valid_rate_limit_with_per_key_override():
+    config = GatewayConfig.model_validate(
+        with_rate_limit(
+            {"capacity": 20, "refill_per_second": 10}, {"capacity": 100, "refill_per_second": 50}
+        )
+    )
+    assert config.rate_limit.default.to_limit().capacity == 20
+    assert config.auth.keys[0].rate_limit.to_limit().refill_per_second == 50
+
+
+@pytest.mark.parametrize(
+    "default",
+    [
+        {"capacity": 0, "refill_per_second": 1},
+        {"capacity": 10, "refill_per_second": 0},
+        {"capacity": 10, "refill_per_second": -1},
+        {"capacity": 10},
+        {"capacity": 10, "refill_per_second": 1, "burst": 5},  # unknown key
+    ],
+)
+def test_bad_rate_limit_is_rejected(default):
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate(with_rate_limit(default))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"backend": "redis"},  # no redis_url
+        {"backend": "redis", "redis_url": "localhost:6379"},  # no scheme
+        {"backend": "postgres"},
+        {"backend": "redis", "redis_url": "redis://r:6379", "redis_timeout_seconds": 0},
+    ],
+)
+def test_bad_redis_settings_are_rejected(extra):
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate(
+            {
+                "routes": [{"path_prefix": "/api", "upstream": "http://a:1"}],
+                "rate_limit": {"default": {"capacity": 1, "refill_per_second": 1}, **extra},
+            }
+        )
+
+
+def test_valid_redis_settings():
+    config = GatewayConfig.model_validate(
+        {
+            "routes": [{"path_prefix": "/api", "upstream": "http://a:1"}],
+            "rate_limit": {
+                "default": {"capacity": 1, "refill_per_second": 1},
+                "backend": "redis",
+                "redis_url": "redis://redis:6379/0",
+            },
+        }
+    )
+    assert config.rate_limit.backend == "redis"
+    assert config.rate_limit.fail_open is True

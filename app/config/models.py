@@ -6,6 +6,7 @@ failing later inside a request.
 """
 
 import re
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -17,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.ratelimit.base import Limit
 from app.security import hash_api_key
 
 
@@ -51,6 +53,19 @@ class RouteConfig(BaseModel):
         return v.rstrip("/")
 
 
+class LimitConfig(BaseModel):
+    """A token bucket: `capacity` is the largest burst, `refill_per_second`
+    the long-run average rate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capacity: int = Field(..., gt=0, le=1_000_000)
+    refill_per_second: float = Field(..., gt=0)
+
+    def to_limit(self) -> Limit:
+        return Limit(self.capacity, self.refill_per_second)
+
+
 class ApiKeyConfig(BaseModel):
     """One API key: who it belongs to and which routes it may use.
 
@@ -64,6 +79,8 @@ class ApiKeyConfig(BaseModel):
     client: str = Field(..., pattern=r"^[A-Za-z0-9._-]{1,64}$")
     key_sha256: str
     routes: list[str] = Field(..., min_length=1, description="route prefixes this key may use")
+    # Optional per-client limit. Unset: the rate_limit.default applies.
+    rate_limit: LimitConfig | None = None
 
     @field_validator("key_sha256")
     @classmethod
@@ -108,6 +125,32 @@ class AuthConfig(BaseModel):
         return self._by_hash.get(hash_api_key(presented_key))
 
 
+class RateLimitConfig(BaseModel):
+    """If this section is present in config.yaml, requests are rate limited."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default: LimitConfig
+
+    # memory: buckets inside this process. Fine for a single process.
+    # redis:  buckets shared by every gateway process and replica.
+    backend: Literal["memory", "redis"] = "memory"
+    redis_url: str | None = None
+    redis_timeout_seconds: float = Field(0.25, gt=0)
+    # If Redis is down: true lets requests through (availability first),
+    # false rejects them with 429 (protection first).
+    fail_open: bool = True
+
+    @model_validator(mode="after")
+    def check_redis(self) -> "RateLimitConfig":
+        if self.backend == "redis":
+            if not self.redis_url:
+                raise ValueError("backend 'redis' needs redis_url")
+            if not self.redis_url.startswith(("redis://", "rediss://", "unix://")):
+                raise ValueError("redis_url must start with redis://, rediss:// or unix://")
+        return self
+
+
 class GatewayConfig(BaseModel):
     """Top-level config. New features (auth keys, rate limits) get fields here."""
 
@@ -116,6 +159,7 @@ class GatewayConfig(BaseModel):
     routes: list[RouteConfig] = Field(..., min_length=1)
     upstream_timeout_seconds: float = Field(5.0, gt=0)
     auth: AuthConfig | None = None  # None: auth off, every request allowed
+    rate_limit: RateLimitConfig | None = None  # None: no rate limiting
 
     @model_validator(mode="after")
     def check_and_sort_routes(self) -> "GatewayConfig":

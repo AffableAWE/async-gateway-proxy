@@ -15,8 +15,11 @@ from fastapi.responses import JSONResponse
 from app.config import GatewayConfig, load_config
 from app.logging_config import setup_logging
 from app.middleware.auth import AuthMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIDMiddleware
 from app.proxy import forward_request
+from app.ratelimit import MemoryRateLimiter, RateLimiter
+from app.ratelimit.redis_backend import RedisRateLimiter
 from app.request_context import get_request_id
 from app.router import match_route
 
@@ -28,12 +31,14 @@ PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 def create_app(
     config: GatewayConfig | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     """Build the gateway app.
 
     Production calls this with no arguments: config comes from the file in
     $GATEWAY_CONFIG and httpx talks to the real network. Tests pass a config
-    object and a fake transport instead, so no file or network is needed.
+    object and a fake transport instead, so no file or network is needed,
+    and can pass a rate limiter with a fake clock.
     """
 
     @asynccontextmanager
@@ -60,6 +65,17 @@ def create_app(
         # Accept-Encoding could get it a gzipped body it can't read.
         app.state.http_client.headers.clear()
 
+        # "is not None", not "or": an empty limiter has len() == 0, so it is
+        # falsy, and "or" would silently swap in a different one.
+        app.state.rate_limiter = (
+            rate_limiter if rate_limiter is not None else build_rate_limiter(app.state.config)
+        )
+        if isinstance(app.state.rate_limiter, RedisRateLimiter):
+            # Start even if Redis is down: the limiter fails open or closed
+            # per request, and Redis may come back. Just say so loudly.
+            if not await app.state.rate_limiter.ping():
+                logger.error("rate_limit_redis_unreachable_at_startup")
+
         auth = app.state.config.auth
         logger.info(
             "gateway_startup",
@@ -68,6 +84,11 @@ def create_app(
                 "routes": [r.path_prefix for r in app.state.config.routes],
                 "auth": "on" if auth is not None else "off",
                 "api_keys": len(auth.keys) if auth is not None else 0,
+                "rate_limit": (
+                    app.state.config.rate_limit.backend
+                    if app.state.config.rate_limit is not None
+                    else "off"
+                ),
             },
         )
         if auth is None:
@@ -75,6 +96,7 @@ def create_app(
         try:
             yield
         finally:
+            await app.state.rate_limiter.close()
             await app.state.http_client.aclose()
             logger.info("gateway_shutdown")
 
@@ -83,8 +105,10 @@ def create_app(
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     # Middleware order: the LAST one added runs FIRST (outermost). So a
-    # request passes RequestID -> Auth -> routing. Request ID stays
-    # outermost, so even a 401 is logged with an ID.
+    # request passes RequestID -> Auth -> RateLimit -> routing.
+    #   RequestID outermost: even a 401 or 429 is logged with an ID.
+    #   Auth before RateLimit: the limiter needs to know who the caller is.
+    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RequestIDMiddleware)
 
@@ -147,6 +171,20 @@ def create_app(
         )
 
     return app
+
+
+def build_rate_limiter(config: GatewayConfig) -> RateLimiter:
+    settings = config.rate_limit
+    if settings is not None and settings.backend == "redis":
+        assert settings.redis_url is not None  # checked by the config schema
+        return RedisRateLimiter.from_url(
+            settings.redis_url,
+            timeout_seconds=settings.redis_timeout_seconds,
+            fail_open=settings.fail_open,
+        )
+    # Built even when rate limiting is off: it costs nothing until used,
+    # and Phase 7's hot reload may turn limiting on at runtime.
+    return MemoryRateLimiter()
 
 
 app = create_app()
