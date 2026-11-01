@@ -21,6 +21,7 @@ from app.proxy import forward_request
 from app.ratelimit import MemoryRateLimiter, RateLimiter
 from app.ratelimit.redis_backend import RedisRateLimiter
 from app.request_context import get_request_id
+from app.resilience.guards import UpstreamGuards
 from app.router import match_route
 
 logger = logging.getLogger("gateway.main")
@@ -32,13 +33,14 @@ def create_app(
     config: GatewayConfig | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     rate_limiter: RateLimiter | None = None,
+    guards: UpstreamGuards | None = None,
 ) -> FastAPI:
     """Build the gateway app.
 
     Production calls this with no arguments: config comes from the file in
     $GATEWAY_CONFIG and httpx talks to the real network. Tests pass a config
     object and a fake transport instead, so no file or network is needed,
-    and can pass a rate limiter with a fake clock.
+    and can pass a rate limiter and upstream guards with a fake clock.
     """
 
     @asynccontextmanager
@@ -70,6 +72,9 @@ def create_app(
         app.state.rate_limiter = (
             rate_limiter if rate_limiter is not None else build_rate_limiter(app.state.config)
         )
+        # Retry budgets and circuit breakers, one per upstream.
+        app.state.guards = guards if guards is not None else UpstreamGuards()
+
         if isinstance(app.state.rate_limiter, RedisRateLimiter):
             # Start even if Redis is down: the limiter fails open or closed
             # per request, and Redis may come back. Just say so loudly.
@@ -89,6 +94,12 @@ def create_app(
                     if app.state.config.rate_limit is not None
                     else "off"
                 ),
+                "retries": (
+                    app.state.config.retries.max_attempts
+                    if app.state.config.retries is not None
+                    else "off"
+                ),
+                "circuit_breaker": "on" if app.state.config.circuit_breaker is not None else "off",
             },
         )
         if auth is None:
@@ -167,7 +178,8 @@ def create_app(
             request=request,
             route=route,
             client=request.app.state.http_client,
-            timeout_seconds=config.upstream_timeout_seconds,
+            config=config,
+            guards=request.app.state.guards,
         )
 
     return app

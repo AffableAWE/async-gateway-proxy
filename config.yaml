@@ -36,3 +36,21 @@ rate_limit:
   # backend: redis
   # redis_url: redis://localhost:6379/0
   # fail_open: true             # Redis down: allow (true) or 429 (false)
+
+# Retries: failed upstream calls are tried again, after a random backoff.
+# Only when safe: connect failures for any method; 502/503/504 and broken
+# connections only for GET, HEAD, OPTIONS, PUT, DELETE. Timeouts never.
+# Remove this section for one attempt per request.
+retries:
+  max_attempts: 3               # total, including the first try
+  base_delay_seconds: 0.05      # backoff: random in [0, base * 2^n], capped
+  max_delay_seconds: 1.0
+  budget_ratio: 0.2             # retries <= 20% of recent requests per upstream
+  budget_min_per_second: 1.0    # ...plus this floor, for quiet upstreams
+
+# Circuit breaker, one per upstream: after failure_threshold failures in a
+# row, fail fast with 503 for recovery_timeout_seconds, then let one probe
+# request through. Remove this section to turn breakers off.
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout_seconds: 10

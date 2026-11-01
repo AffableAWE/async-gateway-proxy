@@ -226,3 +226,39 @@ def test_valid_redis_settings():
     )
     assert config.rate_limit.backend == "redis"
     assert config.rate_limit.fail_open is True
+
+
+# --- retries and circuit breaker -------------------------------------------
+
+ONE_ROUTE = {"routes": [{"path_prefix": "/api", "upstream": "http://a:1"}]}
+
+
+def test_resilience_is_off_when_the_sections_are_missing():
+    config = GatewayConfig.model_validate(ONE_ROUTE)
+    assert config.retries is None
+    assert config.circuit_breaker is None
+
+
+def test_resilience_defaults():
+    config = GatewayConfig.model_validate({**ONE_ROUTE, "retries": {}, "circuit_breaker": {}})
+    assert config.retries.max_attempts == 3
+    assert config.retries.budget_ratio == 0.2
+    assert config.circuit_breaker.failure_threshold == 5
+    assert config.circuit_breaker.recovery_timeout_seconds == 30
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"retries": {"max_attempts": 0}},
+        {"retries": {"max_attempts": 11}},
+        {"retries": {"base_delay_seconds": 2, "max_delay_seconds": 1}},
+        {"retries": {"budget_ratio": -0.1}},
+        {"retries": {"attempts": 3}},  # unknown key
+        {"circuit_breaker": {"failure_threshold": 0}},
+        {"circuit_breaker": {"recovery_timeout_seconds": 0}},
+    ],
+)
+def test_bad_resilience_settings_are_rejected(section):
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate({**ONE_ROUTE, **section})

@@ -151,6 +151,35 @@ class RateLimitConfig(BaseModel):
         return self
 
 
+class RetryConfig(BaseModel):
+    """If present, failed upstream calls are retried (see app/resilience/retry.py)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_attempts: int = Field(3, ge=1, le=10)  # total, including the first try
+    base_delay_seconds: float = Field(0.05, ge=0)
+    max_delay_seconds: float = Field(1.0, ge=0)
+    # Retry budget, per upstream: retries <= ratio * requests in the last
+    # 10 s, plus a floor of min_per_second * 10 s.
+    budget_ratio: float = Field(0.2, ge=0)
+    budget_min_per_second: float = Field(1.0, ge=0)
+
+    @model_validator(mode="after")
+    def check_delays(self) -> "RetryConfig":
+        if self.max_delay_seconds < self.base_delay_seconds:
+            raise ValueError("max_delay_seconds must be >= base_delay_seconds")
+        return self
+
+
+class CircuitBreakerConfig(BaseModel):
+    """If present, each upstream gets a circuit breaker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    failure_threshold: int = Field(5, ge=1)  # failures in a row before opening
+    recovery_timeout_seconds: float = Field(30.0, gt=0)  # open this long, then probe
+
+
 class GatewayConfig(BaseModel):
     """Top-level config. New features (auth keys, rate limits) get fields here."""
 
@@ -160,6 +189,8 @@ class GatewayConfig(BaseModel):
     upstream_timeout_seconds: float = Field(5.0, gt=0)
     auth: AuthConfig | None = None  # None: auth off, every request allowed
     rate_limit: RateLimitConfig | None = None  # None: no rate limiting
+    retries: RetryConfig | None = None  # None: one attempt, no retries
+    circuit_breaker: CircuitBreakerConfig | None = None  # None: no breakers
 
     @model_validator(mode="after")
     def check_and_sort_routes(self) -> "GatewayConfig":
