@@ -8,9 +8,9 @@ the backend's response. It is built to sit in front of a custom multithreaded
 C++ HTTP server.
 
 The project is built in phases. This README describes what exists now
-(up to Phase 5: core proxy, request tracing, API key auth, rate limiting,
-retries and circuit breaking). Later phases are listed under
-[Roadmap](#roadmap).
+(up to Phase 6: core proxy, request tracing, API key auth, rate limiting,
+retries, circuit breaking, streaming and graceful shutdown). Later phases
+are listed under [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -57,9 +57,17 @@ serves other requests on the same thread.
   appended to, never overwritten. Apart from the `X-Forwarded-*`,
   `X-Request-ID` and `X-Gateway-Client` headers, the gateway adds nothing
   of its own.
+- **Streaming in both directions.** Response bodies are passed on chunk by
+  chunk as they arrive; request bodies over 1 MiB are streamed to the
+  upstream. Gateway memory stays flat: a 200 MB download peaks at 74 MB
+  RSS (65 MB idle), against 491 MB when buffered. A slow stream's first
+  byte arrives in 4 ms instead of after the whole body.
 - **Bodies pass through untouched.** A gzipped upstream response reaches the
-  client still gzipped, with its `Content-Encoding` intact. Repeated headers
-  such as `Set-Cookie` are kept.
+  client still gzipped, with its `Content-Encoding` intact. The upstream's
+  `Content-Length` is kept. Repeated headers such as `Set-Cookie` are kept.
+- **Graceful shutdown.** On SIGTERM the gateway stops accepting connections,
+  lets in-flight requests and streams finish (up to 25 s), then closes its
+  upstream connection pool.
 - **Connection pooling.** One `httpx.AsyncClient` for the life of the
   process, so keep-alive connections to each upstream are reused.
 - **Distinct failure codes.** `504` for upstream timeout, `502` for an
@@ -95,6 +103,7 @@ serves other requests on the same thread.
 ```
 app/
   main.py            app factory, lifespan, /health, catch-all route
+  server.py          process start-up (`python -m app`): server flags, env vars
   router.py          route matching and upstream URL building (pure functions)
   proxy.py           forwarding, header filtering, error mapping
   logging_config.py  JSON log formatter, request ID on every record
@@ -134,23 +143,29 @@ pip install -r requirements-dev.txt
 uvicorn dummy_upstream.main:app --port 8001
 
 # Terminal 2: the gateway
-uvicorn app.main:app --port 8000 --no-proxy-headers --no-access-log
+python -m app
 ```
 
-Why the two flags:
+`python -m app` starts uvicorn with the flags a gateway needs, set in one
+place (`app/server.py`) so they can't be forgotten:
 
-- `--no-proxy-headers`: by default Uvicorn trusts `X-Forwarded-For` from
-  localhost and rewrites the client address from it. The gateway is the edge,
-  so it must record the real TCP peer, not a value the caller can fake.
-- `--no-access-log`: the gateway writes its own `request_completed` JSON
-  line for every request, so Uvicorn's access log would only duplicate it.
+- **No proxy headers.** By default uvicorn trusts `X-Forwarded-For` from
+  localhost and rewrites the client address from it. The gateway is the
+  edge, so it must record the real TCP peer, not a value the caller can fake.
+- **No access log.** The gateway writes its own `request_completed` JSON
+  line for every request; uvicorn's would only duplicate it.
+- **Graceful shutdown timeout.** How long to wait for in-flight requests
+  after SIGTERM before cutting them off.
 
 Environment variables:
 
-| Variable         | Default       | Purpose                     |
-|------------------|---------------|-----------------------------|
-| `GATEWAY_CONFIG` | `config.yaml` | Path to the routing config  |
-| `LOG_LEVEL`      | `INFO`        | Log level                   |
+| Variable                           | Default       | Purpose                              |
+|------------------------------------|---------------|--------------------------------------|
+| `GATEWAY_CONFIG`                   | `config.yaml` | Path to the routing config           |
+| `LOG_LEVEL`                        | `INFO`        | Log level                            |
+| `GATEWAY_HOST`                     | `127.0.0.1`   | Listen address (`0.0.0.0` in Docker) |
+| `GATEWAY_PORT`                     | `8000`        | Listen port                          |
+| `GATEWAY_GRACEFUL_TIMEOUT_SECONDS` | `25`          | Max drain time after SIGTERM         |
 
 ## Configuration
 
@@ -356,6 +371,51 @@ circuit_state_change  half_open -> closed
 proxy_forward         /api/items/1  200  attempts 1
 ```
 
+## Streaming and graceful shutdown
+
+**Responses** are streamed: each chunk from the upstream goes to the client
+as it arrives, through `httpx`'s `aiter_raw()` and a Starlette
+`StreamingResponse`. **Request bodies** up to `max_buffered_request_bytes`
+(1 MiB) are held in memory, because only a body the gateway still holds can
+be retried. Larger ones are streamed straight through and are not retried.
+
+Measured on the same machine, 200 MB through the gateway:
+
+| | Buffered (Phase 5) | Streaming (Phase 6) |
+|---|---|---|
+| Peak gateway RSS, 200 MB download | 491 MB | 74 MB (65 MB idle) |
+| Peak gateway RSS, 200 MB upload | 491 MB | 74 MB |
+| First byte of a 5-chunk stream sent 0.5 s apart | 2.0 s | 0.004 s |
+
+Design choices:
+
+- **Bytes pass through unchanged,** so the upstream's `Content-Length` stays
+  correct and is kept. A streamed upload keeps the client's
+  `Content-Length` too, instead of switching to chunked encoding, which
+  some servers (and many hand-written ones) don't accept.
+- **Backpressure.** Each chunk is handed to the server, which waits while
+  the client's socket buffer is full. The gateway doesn't read more from
+  the upstream until the client catches up, so a slow client slows the
+  upstream read rather than filling the gateway's memory.
+- **Buffer to retry.** Retries need the body twice. Small bodies (most API
+  calls) are buffered and keep retries; big uploads stream and don't.
+  Envoy makes the same trade-off with its retry buffer limit.
+- **An upstream that breaks mid-body cuts the client off.** By then a `200`
+  and its headers have been sent, so a clean `502` is impossible. The
+  gateway aborts the connection, so the client sees a truncated transfer
+  (curl exits with code 18) instead of a short body that looks complete.
+  The access log line gets `"error": "UpstreamStreamError"`.
+- **A client that hangs up releases the upstream.** The upstream connection
+  is closed explicitly, not left for garbage collection, and a
+  `client_disconnected` line is logged.
+
+**Graceful shutdown** (SIGTERM, which is what Docker and Kubernetes send):
+uvicorn stops accepting connections, waits for in-flight requests (streams
+included) up to `GATEWAY_GRACEFUL_TIMEOUT_SECONDS`, then runs the app's
+shutdown, which closes the upstream connection pool. Measured: SIGTERM 1 s
+into a 2.5 s stream; the stream finished intact, a new request during the
+drain was refused, and the process exited as soon as the stream ended.
+
 ## Try it
 
 The bundled `config.yaml` has one key for local development only:
@@ -407,6 +467,19 @@ curl "localhost:8000/api/flaky?key=demo1&fail=2" -H "$K"
 
 # Retries run out: 3 attempts, then the upstream's own 503
 curl -i localhost:8000/api/status/503 -H "$K"
+
+# Streaming: lines arrive one by one, every 0.5 s (-N turns off curl's buffer)
+curl -N "localhost:8000/api/stream?chunks=5&interval=0.5" -H "$K"
+
+# 200 MB through the gateway; watch its memory stay flat
+curl -o /dev/null "localhost:8000/api/large?mb=200" -H "$K"
+head -c 200000000 /dev/urandom > big.bin
+curl "localhost:8000/api/upload" -H "$K" --data-binary @big.bin
+# {"bytes":200000000,"sha256":"...","content_length":"200000000",...}
+
+# Graceful shutdown: start a slow stream, then Ctrl+C the gateway while it
+# runs. The stream still completes; then the gateway exits.
+curl -N "localhost:8000/api/stream?chunks=10&interval=0.5" -H "$K"
 
 # A real timeout: the upstream waits 6 s, the gateway gives up after 5 s
 curl -i "localhost:8000/api/slow?delay=6" -H "$K"
@@ -465,8 +538,13 @@ real Redis service container.
 
 ## Limitations
 
-- Request and response bodies are read fully into memory. Large uploads,
-  downloads and server-sent events need streaming (Phase 6).
+- Request bodies over 1 MiB are not retried, since they are streamed.
+- An upstream that breaks mid-body produces a cut-off response and a
+  traceback in uvicorn's log; ASGI has no quieter way to abort.
+- During the drain the gateway refuses new connections. Behind a load
+  balancer that's fine if the balancer stops sending first; in Kubernetes
+  that needs a short `preStop` sleep (Phase 10), because removing the pod
+  from the Service and sending SIGTERM happen at the same time.
 - Circuit breakers and retry budgets live in each gateway process. Three
   replicas each learn about a dead upstream on their own (5 failed requests
   each), which is usually fine.
@@ -504,7 +582,7 @@ real Redis service container.
 | 3     | API key authentication with per-key route access (done) |
 | 4     | Token-bucket rate limiting (in-memory, then Redis) (done) |
 | 5     | Retries with backoff and jitter, retry budget, circuit breaker (done) |
-| 6     | Streaming bodies and graceful shutdown |
+| 6     | Streaming bodies and graceful shutdown (done) |
 | 7     | Readiness probe, Prometheus metrics, config hot reload |
 | 8     | Docker and docker-compose (gateway, upstream, C++ server, Redis, Prometheus) |
 | 9     | Load testing and benchmarks against direct and NGINX baselines |
