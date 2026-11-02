@@ -8,9 +8,9 @@ the backend's response. It is built to sit in front of a custom multithreaded
 C++ HTTP server.
 
 The project is built in phases. This README describes what exists now
-(up to Phase 6: core proxy, request tracing, API key auth, rate limiting,
-retries, circuit breaking, streaming and graceful shutdown). Later phases
-are listed under [Roadmap](#roadmap).
+(up to Phase 7: core proxy, request tracing, API key auth, rate limiting,
+retries, circuit breaking, streaming, graceful shutdown, metrics, readiness
+and hot reload). Later phases are listed under [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -70,6 +70,14 @@ serves other requests on the same thread.
   upstream connection pool.
 - **Connection pooling.** One `httpx.AsyncClient` for the life of the
   process, so keep-alive connections to each upstream are reused.
+- **Prometheus metrics** on a separate admin port (9100): request rates and
+  latency histograms per route, upstream attempts by outcome, retries,
+  breaker states, auth and rate-limit rejections, config reloads.
+- **Liveness and readiness.** `/health` says the process is alive; `/ready`
+  says it can serve. A dead upstream doesn't make the gateway unready.
+- **Hot reload.** Edit `config.yaml` and it applies within 5 s, or at once
+  with `kill -HUP`. Invalid files are rejected and the old config keeps
+  serving. Each request runs under exactly one config version.
 - **Distinct failure codes.** `504` for upstream timeout, `502` for an
   unreachable upstream, upstream `5xx` passed through as is.
 - **Request IDs end to end.** Each request gets an ID that appears in every
@@ -103,7 +111,9 @@ serves other requests on the same thread.
 ```
 app/
   main.py            app factory, lifespan, /health, catch-all route
-  server.py          process start-up (`python -m app`): server flags, env vars
+  server.py          process start-up (`python -m app`): server flags, metrics port
+  metrics.py         Prometheus metrics, one registry per app
+  health.py          readiness checks for /ready
   router.py          route matching and upstream URL building (pure functions)
   proxy.py           forwarding, header filtering, error mapping
   logging_config.py  JSON log formatter, request ID on every record
@@ -124,6 +134,7 @@ app/
   config/
     models.py        Pydantic schema for config.yaml
     loader.py        reads and validates the YAML file
+    reload.py        hot reload: watch, validate, swap
 dummy_upstream/
   main.py            small FastAPI backend for local testing
 tests/               pytest suite, no network needed
@@ -166,6 +177,7 @@ Environment variables:
 | `GATEWAY_HOST`                     | `127.0.0.1`   | Listen address (`0.0.0.0` in Docker) |
 | `GATEWAY_PORT`                     | `8000`        | Listen port                          |
 | `GATEWAY_GRACEFUL_TIMEOUT_SECONDS` | `25`          | Max drain time after SIGTERM         |
+| `GATEWAY_METRICS_PORT`             | `9100`        | Prometheus metrics port; `0` = off   |
 
 ## Configuration
 
@@ -416,6 +428,105 @@ shutdown, which closes the upstream connection pool. Measured: SIGTERM 1 s
 into a 2.5 s stream; the stream finished intact, a new request during the
 drain was refused, and the process exited as soon as the stream ended.
 
+## Observability and operations
+
+### Metrics
+
+`python -m app` serves Prometheus metrics at `http://localhost:9100/metrics`,
+on a separate port from the API:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `gateway_requests_total` | counter | `route`, `method`, `status` |
+| `gateway_request_duration_seconds` | histogram | `route` |
+| `gateway_requests_in_flight` | gauge | |
+| `gateway_upstream_attempts_total` | counter | `upstream`, `outcome` (success, connect, timeout, transport, status) |
+| `gateway_upstream_retries_total` | counter | `upstream` |
+| `gateway_retry_budget_exhausted_total` | counter | `upstream` |
+| `gateway_circuit_breaker_state` | gauge | `upstream` (0 closed, 1 half-open, 2 open) |
+| `gateway_circuit_open_rejections_total` | counter | `upstream` |
+| `gateway_upstream_stream_aborts_total` | counter | `upstream` |
+| `gateway_auth_rejections_total` | counter | `reason` (missing_key, invalid_key, route_not_allowed) |
+| `gateway_rate_limited_total` | counter | `client` |
+| `gateway_config_reloads_total` | counter | `result` (success, failed, rejected) |
+| `gateway_config_last_success_timestamp_seconds` | gauge | |
+
+Example queries:
+
+```promql
+# p99 latency per route over 5 minutes
+histogram_quantile(0.99, sum by (le, route) (rate(gateway_request_duration_seconds_bucket[5m])))
+
+# share of upstream attempts that failed
+sum(rate(gateway_upstream_attempts_total{outcome!="success"}[5m]))
+  / sum(rate(gateway_upstream_attempts_total[5m]))
+
+# any breaker open?
+max(gateway_circuit_breaker_state) == 2
+```
+
+Design choices:
+
+- **Separate port.** The API port faces the internet; the metrics port is
+  only reachable inside the cluster. Route names, client names and error
+  rates help attackers too. `/metrics` on the API port is just another
+  path, and needs a key like any other.
+- **No raw paths as labels.** `route` is the matched prefix, so
+  `/api/users/1` and `/api/users/2` are one time series, not two. Raw paths
+  would create a series per URL and eventually overload Prometheus.
+  Requests rejected before routing (401, 429) are labelled `none`.
+- **Breaker state is read at scrape time,** with a read-only `peek_state()`.
+  The metrics server runs in its own thread, so it must never change
+  breaker state behind the event loop.
+- **One registry per app,** not `prometheus_client`'s global one, so tests
+  can build many apps side by side.
+
+### Liveness and readiness
+
+| Probe | Question | If it fails, Kubernetes... |
+|---|---|---|
+| `/health` | Is the process broken? | restarts the pod |
+| `/ready` | Can it serve right now? | stops sending it traffic, no restart |
+
+```json
+{"status": "ready", "checks": {"config": "ok", "upstream_pool": "ok", "rate_limit_memory": "ok"}, "open_circuits": 0}
+```
+
+`/ready` fails (503) if the upstream connection pool is closed, or if rate
+limiting uses Redis with `fail_open: false` and Redis is down, since then
+every request would get 429. **It does not fail when an upstream is down.**
+If one dead backend made every gateway pod unready, Kubernetes would pull
+the whole gateway, and every healthy route would go down with it. Dead
+upstreams are the circuit breaker's job; `/ready` only reports how many
+breakers are open. It never lists upstream addresses, since it is public.
+
+### Hot reload
+
+Edit `config.yaml` and the gateway applies it within
+`reload_interval_seconds` (5 s), or at once with `kill -HUP <pid>`. No
+restart, no dropped connections. Routes, API keys, rate limits, retries,
+breaker settings and timeouts can all change this way, so revoking a key
+takes seconds.
+
+- **Changes are found by hashing the file,** not by modification time. A
+  Kubernetes ConfigMap update swaps a symlink, which mtime checks can miss.
+- **Validated before use.** Broken YAML or an invalid rule is rejected,
+  logged once with the reason (`config_reload_failed`), and the old config
+  keeps serving. A typo can't take the gateway down.
+- **Some settings need a restart.** Moving the rate limiter between memory
+  and Redis (or changing its Redis settings) is rejected with
+  `config_reload_rejected` instead of being half-applied.
+- **Atomic swap, one config per request.** The new config is installed
+  with one reference assignment. Each request takes a snapshot when it
+  arrives, so a reload can't land halfway through a request, with auth
+  under the old config and routing under the new.
+- **Dependent state is reset.** If breaker or retry settings change, those
+  breakers and budgets are rebuilt with the new values. State for upstreams
+  that no longer appear in any route is dropped.
+- **Watch for SIGHUP.** Without a handler, SIGHUP's default action is to
+  terminate the process, so `kill -HUP` on a server that doesn't handle it
+  shuts it down. The gateway installs one at startup.
+
 ## Try it
 
 The bundled `config.yaml` has one key for local development only:
@@ -480,6 +591,14 @@ curl "localhost:8000/api/upload" -H "$K" --data-binary @big.bin
 # Graceful shutdown: start a slow stream, then Ctrl+C the gateway while it
 # runs. The stream still completes; then the gateway exits.
 curl -N "localhost:8000/api/stream?chunks=10&interval=0.5" -H "$K"
+
+# Readiness, and metrics on the admin port
+curl localhost:8000/ready
+curl -s localhost:9100/metrics | grep ^gateway_requests_total
+
+# Hot reload: add a route in config.yaml (and to the dev key's routes),
+# save, and within 5 s it works. Or apply it at once:
+kill -HUP $(pgrep -f "python -m app")
 
 # A real timeout: the upstream waits 6 s, the gateway gives up after 5 s
 curl -i "localhost:8000/api/slow?delay=6" -H "$K"
@@ -557,13 +676,15 @@ real Redis service container.
   per-IP limit in front of auth.
 - One token per request regardless of cost; a 10 MB upload costs the same
   as a health check.
-- API keys don't expire and can't be revoked without a restart (hot reload
-  comes in Phase 7). Key hashes live in the config file; in Kubernetes
-  (Phase 10) they move to a Secret.
+- API keys don't expire. They can be revoked with a hot reload. Key hashes
+  live in the config file; in Kubernetes (Phase 10) they move to a Secret.
 - No JWT or OAuth. Static API keys suit service-to-service calls; user
   login would need tokens with expiry and scopes.
-- `/health` is liveness only. There is no readiness check against upstreams.
-- Config is read once at startup. Changing it needs a restart.
+- Metrics are per process. With several uvicorn workers in one container,
+  each would need its own port or prometheus_client's multiprocess mode;
+  the gateway runs one worker per container and scales with replicas.
+- A reload that changes breaker settings resets those breakers to closed,
+  so an upstream that was failing gets tried again.
 - httpx timeouts apply per operation (connect, each read), not as one total
   deadline for the request.
 - One upstream URL per route, so no load balancing across replicas.
@@ -583,7 +704,7 @@ real Redis service container.
 | 4     | Token-bucket rate limiting (in-memory, then Redis) (done) |
 | 5     | Retries with backoff and jitter, retry budget, circuit breaker (done) |
 | 6     | Streaming bodies and graceful shutdown (done) |
-| 7     | Readiness probe, Prometheus metrics, config hot reload |
+| 7     | Readiness probe, Prometheus metrics, config hot reload (done) |
 | 8     | Docker and docker-compose (gateway, upstream, C++ server, Redis, Prometheus) |
 | 9     | Load testing and benchmarks against direct and NGINX baselines |
 | 10    | Kubernetes manifests and deployment on a k3s VPS |
