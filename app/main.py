@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.config import GatewayConfig, load_config
+from app.health import readiness
 from app.logging_config import setup_logging
 from app.metrics import GatewayMetrics
 from app.middleware.auth import AuthMiddleware
@@ -140,7 +141,13 @@ def create_app(
         """
         return {"status": "ok"}
 
-    # Registered after /health, so /health is matched first. Every other
+    @app.get("/ready")
+    async def ready(request: Request) -> JSONResponse:
+        """Readiness: should this instance get traffic? See app/health.py."""
+        is_ready, body = await readiness(request.app)
+        return JSONResponse(status_code=200 if is_ready else 503, content=body)
+
+    # Registered after /health and /ready, so those are matched first. Every other
     # path and method lands here. `{full_path:path}` matches across slashes.
     @app.api_route("/{full_path:path}", methods=PROXY_METHODS)
     async def gateway(full_path: str, request: Request) -> Response:

@@ -23,9 +23,10 @@ logger = logging.getLogger("gateway.auth")
 
 API_KEY_HEADER = b"x-api-key"
 
-# Paths that never need a key. Kubernetes probes and Prometheus can't send
-# one. /ready and /metrics join this list in Phase 7.
-PUBLIC_PATHS = frozenset({"/health"})
+# Paths that never need a key: Kubernetes probes can't send one. They are
+# also never rate limited, so a busy client can't make a pod look dead.
+# (/metrics isn't here: it lives on its own port, see app/server.py.)
+PUBLIC_PATHS = frozenset({"/health", "/ready"})
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
