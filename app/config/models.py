@@ -187,6 +187,10 @@ class GatewayConfig(BaseModel):
 
     routes: list[RouteConfig] = Field(..., min_length=1)
     upstream_timeout_seconds: float = Field(5.0, gt=0)
+    # Request bodies up to this size are read into memory, so they can be
+    # sent again on a retry. Bigger ones are streamed: constant memory, but
+    # no retries. 1 MiB by default.
+    max_buffered_request_bytes: int = Field(1024 * 1024, ge=0)
     auth: AuthConfig | None = None  # None: auth off, every request allowed
     rate_limit: RateLimitConfig | None = None  # None: no rate limiting
     retries: RetryConfig | None = None  # None: one attempt, no retries

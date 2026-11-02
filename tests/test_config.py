@@ -262,3 +262,10 @@ def test_resilience_defaults():
 def test_bad_resilience_settings_are_rejected(section):
     with pytest.raises(ValidationError):
         GatewayConfig.model_validate({**ONE_ROUTE, **section})
+
+
+def test_request_buffer_limit_default_and_validation():
+    assert GatewayConfig.model_validate(ONE_ROUTE).max_buffered_request_bytes == 1024 * 1024
+    assert GatewayConfig.model_validate({**ONE_ROUTE, "max_buffered_request_bytes": 0})
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate({**ONE_ROUTE, "max_buffered_request_bytes": -1})

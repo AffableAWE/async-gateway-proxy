@@ -4,6 +4,10 @@
 
 upstream_timeout_seconds: 5.0
 
+# Request bodies up to this size are held in memory so they can be retried.
+# Bigger ones are streamed straight through: flat memory, but no retries.
+max_buffered_request_bytes: 1048576   # 1 MiB
+
 routes:
   # Dummy upstream for local development:
   #   uvicorn dummy_upstream.main:app --port 8001

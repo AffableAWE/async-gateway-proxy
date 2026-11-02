@@ -3,15 +3,21 @@
 Takes an incoming request plus the route chosen by router.py, sends it to
 the upstream with the shared httpx client, and turns the upstream's answer
 into a response for the original caller.
+
+Bodies are streamed in both directions, so memory stays flat however big
+they are. The one exception: request bodies up to max_buffered_request_bytes
+are read into memory first, because only a body we still hold can be sent
+again on a retry.
 """
 
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 import httpx
 from fastapi import Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import GatewayConfig, RouteConfig
 from app.request_context import get_request_id
@@ -42,8 +48,10 @@ HOP_BY_HOP = frozenset(
 # be wrong.
 REQUEST_STRIP = HOP_BY_HOP | {"host", "content-length"}
 
-# Response side: Starlette sets Content-Length from the body we return.
-RESPONSE_STRIP = HOP_BY_HOP | {"content-length"}
+# Response side: only hop-by-hop. The body is passed on byte for byte, so
+# the upstream's own Content-Length stays correct and is kept; without it
+# the client would get a chunked response and couldn't show progress.
+RESPONSE_STRIP = HOP_BY_HOP
 
 
 def _connection_tokens(headers: list[tuple[str, str]]) -> set[str]:
@@ -118,10 +126,81 @@ def _error(status_code: int, message: str, headers: dict[str, str] | None = None
     )
 
 
+class UpstreamStreamError(Exception):
+    """The upstream broke off in the middle of a response body.
+
+    By then the status line and headers are already with the client, so a
+    clean 502 is impossible. Raising makes the server cut the connection,
+    and the client sees a truncated response instead of a short one that
+    looks complete.
+    """
+
+
+@dataclass
+class _Body:
+    """The request body: in memory (can be resent) or a one-shot stream."""
+
+    content: bytes | AsyncIterator[bytes]
+    replayable: bool
+    size: list[int] = field(default_factory=lambda: [0])  # updated as a stream is read
+
+    @property
+    def bytes_sent(self) -> int:
+        return len(self.content) if isinstance(self.content, bytes) else self.size[0]
+
+
+async def _read_body(request: Request, limit: int) -> _Body:
+    """Buffer the body if it is at most `limit` bytes, else stream it.
+
+    Reads chunk by chunk and stops buffering as soon as the limit is passed,
+    so a huge body never sits in memory whole, even if the client didn't
+    send a Content-Length.
+    """
+    stream = request.stream()
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        return _counting(_Body(stream, replayable=False))
+
+    chunks: list[bytes] = []
+    buffered = 0
+    async for chunk in stream:
+        chunks.append(chunk)
+        buffered += len(chunk)
+        if buffered > limit:
+
+            async def rest() -> AsyncIterator[bytes]:
+                for c in chunks:
+                    yield c
+                async for c in stream:
+                    yield c
+
+            return _counting(_Body(rest(), replayable=False))
+    return _Body(b"".join(chunks), replayable=True)
+
+
+def _counting(body: _Body) -> _Body:
+    source = body.content
+    assert not isinstance(source, bytes)
+
+    async def counted() -> AsyncIterator[bytes]:
+        async for chunk in source:
+            body.size[0] += len(chunk)
+            yield chunk
+
+    body.content = counted()
+    return body
+
+
 @dataclass
 class _Attempt:
-    """The outcome of one try: an upstream answer, an error, or both."""
+    """The outcome of one try.
 
+    On success `response` is open, with its body not yet read: it is
+    streamed to the client later. On a 502/503/504 the (small) body is read
+    here, so the attempt can be retried or returned.
+    """
+
+    response: httpx.Response | None = None
     status_code: int | None = None
     headers: list[tuple[str, str]] | None = None
     content: bytes = b""
@@ -134,27 +213,32 @@ async def _send_once(
     method: str,
     url: str,
     headers: list[tuple[str, str]],
-    body: bytes,
+    body: _Body,
     timeout_seconds: float,
 ) -> _Attempt:
-    # A new request object per try. The body is already in memory (bytes),
-    # so it can be sent again. Phase 6's streaming bodies will make this harder.
     upstream_request = client.build_request(
         method=method,
         url=url,
         headers=headers,
-        content=body,
+        content=body.content,
         # httpx timeouts apply per operation (connect, each read, each write),
-        # not as one total deadline for the whole exchange.
+        # not as one total deadline. Streaming works because a slow but
+        # steady body never waits long for any single chunk.
         timeout=timeout_seconds,
     )
     try:
+        # stream=True: return as soon as the headers arrive, body unread.
         upstream_response = await client.send(upstream_request, stream=True)
+        status = upstream_response.status_code
+        if status not in RETRYABLE_STATUSES:
+            return _Attempt(
+                response=upstream_response,
+                status_code=status,
+                headers=upstream_response.headers.multi_items(),
+            )
+        # A 502/503/504 may be retried, so read its body and let go of the
+        # connection now. Error bodies are small.
         try:
-            # aiter_raw gives the body exactly as the upstream sent it, still
-            # gzip-compressed if it was. If we used .content, httpx would
-            # decompress it while we forwarded `Content-Encoding: gzip`, and
-            # the client would try to unzip plain text.
             content = b"".join([chunk async for chunk in upstream_response.aiter_raw()])
         finally:
             await upstream_response.aclose()
@@ -167,12 +251,11 @@ async def _send_once(
     except httpx.RequestError as exc:
         return _Attempt(error=exc, failure=Failure.TRANSPORT)
 
-    status = upstream_response.status_code
     return _Attempt(
         status_code=status,
         headers=upstream_response.headers.multi_items(),
         content=content,
-        failure=Failure.STATUS if status in RETRYABLE_STATUSES else None,
+        failure=Failure.STATUS,
     )
 
 
@@ -186,22 +269,27 @@ async def forward_request(
     upstream_url = build_upstream_url(request.url.path, route, request.url.query)
     method = request.method
 
-    # MVP simplification: the whole request body is read into memory.
-    # Phase 6 replaces this with streaming.
-    body = await request.body()
+    body = await _read_body(request, config.max_buffered_request_bytes)
     headers = _forwarded_headers(request)
+    if not body.replayable and "content-length" in request.headers:
+        # httpx can't know a stream's length. Passing the client's (the
+        # bytes are forwarded unchanged) keeps a plain Content-Length body
+        # instead of switching to chunked, which some servers don't accept.
+        headers.append(("content-length", request.headers["content-length"]))
 
     retry = config.retries
-    max_attempts = retry.max_attempts if retry is not None else 1
+    # A streamed body is read once, by the first attempt, so it can't be
+    # sent again: no retries for it.
+    max_attempts = retry.max_attempts if retry is not None and body.replayable else 1
     budget = guards.budget_for(route.upstream, config)
     breaker = guards.breaker_for(route.upstream, config)
     if budget is not None:
         budget.record_request()
 
     log_fields = {"method": method, "path": request.url.path, "upstream": upstream_url}
-    # upstream_ms below is time spent on the upstream, retries and waits
-    # included. The access log's duration_ms is the whole request. The gap
-    # between the two is the gateway's own overhead.
+    # upstream_ms below is time spent on the upstream, retries, waits and
+    # body streaming included. The access log's duration_ms is the whole
+    # request. The gap between the two is the gateway's own overhead.
     start = time.perf_counter()  # monotonic: safe for measuring durations
 
     result: _Attempt | None = None
@@ -252,24 +340,19 @@ async def forward_request(
         )
         await guards.sleep(delay)
 
-    return _final_response(result, log_fields, attempts, start, body, config)
+    fields = {**log_fields, "attempts": attempts, "streamed_request": not body.replayable}
+    return _final_response(result, fields, start, body, config)
 
 
 def _final_response(
-    result: _Attempt,
-    log_fields: dict,
-    attempts: int,
-    start: float,
-    body: bytes,
-    config: GatewayConfig,
+    result: _Attempt, fields: dict, start: float, body: _Body, config: GatewayConfig
 ) -> Response:
-    fields = {**log_fields, "attempts": attempts, "upstream_ms": _ms_since(start)}
-
     if isinstance(result.error, httpx.TimeoutException):
         logger.warning(
             "upstream_timeout",
             extra={
                 **fields,
+                "upstream_ms": _ms_since(start),
                 "error_type": type(result.error).__name__,
                 "timeout_seconds": config.upstream_timeout_seconds,
             },
@@ -280,26 +363,110 @@ def _final_response(
         # Connection refused, DNS failure, connection reset...
         logger.error(
             "upstream_unreachable",
-            extra={**fields, "error_type": type(result.error).__name__, "error": str(result.error)},
+            extra={
+                **fields,
+                "upstream_ms": _ms_since(start),
+                "error_type": type(result.error).__name__,
+                "error": str(result.error),
+            },
         )
         return _error(502, "upstream unavailable")
 
     assert result.status_code is not None and result.headers is not None
+    headers = filter_headers(result.headers, RESPONSE_STRIP)
+
+    if result.response is None:
+        # A 502/503/504 that survived every retry, already read: passed on
+        # as the upstream sent it, since its body may say more than ours.
+        _log_forward(fields, start, result.status_code, body, len(result.content))
+        response = Response(content=result.content, status_code=result.status_code)
+        for name, value in headers:
+            response.headers.append(name, value)
+        return response
+
+    stream = _UpstreamStream(result.response, fields, start, body)
+    # Appended one by one, like above: a headers dict would merge repeated
+    # headers such as Set-Cookie into one.
+    for name, value in headers:
+        stream.headers.append(name, value)
+    return stream
+
+
+class _UpstreamStream(StreamingResponse):
+    """Passes the upstream body to the client chunk by chunk.
+
+    Backpressure comes for free: each chunk is handed to the server, which
+    waits while the client's socket buffer is full, so we don't ask the
+    upstream for more until the client has caught up. A slow client slows
+    the upstream read instead of filling the gateway's memory.
+    """
+
+    def __init__(self, upstream: httpx.Response, fields: dict, start: float, body: _Body):
+        super().__init__(self._chunks(), status_code=upstream.status_code)
+        self._upstream = upstream
+        self._fields = fields
+        self._start = start
+        self._body = body
+        self._sent = 0
+        self._finished = False  # whole body passed on
+        self._failed = False  # upstream broke off
+
+    async def _chunks(self) -> AsyncIterator[bytes]:
+        try:
+            # aiter_raw gives the body exactly as the upstream sent it, still
+            # gzip-compressed if it was. aiter_bytes would decompress it while
+            # we forward `Content-Encoding: gzip`, and the client would then
+            # try to unzip plain bytes.
+            async for chunk in self._upstream.aiter_raw():
+                self._sent += len(chunk)
+                yield chunk
+        except httpx.HTTPError as exc:
+            self._failed = True
+            logger.error(
+                "upstream_stream_aborted",
+                extra={
+                    **self._fields,
+                    "status_code": self._upstream.status_code,
+                    "response_bytes": self._sent,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise UpstreamStreamError(str(exc)) from exc
+        self._finished = True
+        _log_forward(self._fields, self._start, self._upstream.status_code, self._body, self._sent)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Always give the upstream connection back, also when the client
+            # hung up mid-body. Starlette then cancels the streaming task,
+            # possibly while our generator sits at a `yield`, and that
+            # generator's own cleanup would only run whenever it is
+            # garbage-collected.
+            await self._upstream.aclose()
+            if not self._finished and not self._failed:
+                logger.info(
+                    "client_disconnected",
+                    extra={
+                        **self._fields,
+                        "status_code": self._upstream.status_code,
+                        "response_bytes": self._sent,
+                    },
+                )
+
+
+def _log_forward(fields: dict, start: float, status: int, body: _Body, sent: int) -> None:
     logger.info(
         "proxy_forward",
         extra={
             **fields,
-            "status_code": result.status_code,
-            "request_bytes": len(body),
-            "response_bytes": len(result.content),
+            "status_code": status,
+            "upstream_ms": _ms_since(start),
+            "request_bytes": body.bytes_sent,
+            "response_bytes": sent,
         },
     )
-    # A 502/503/504 that survived every retry is passed through as the
-    # upstream sent it: its body may say more than our own error would.
-    response = Response(content=result.content, status_code=result.status_code)
-    for name, value in filter_headers(result.headers, RESPONSE_STRIP):
-        response.headers.append(name, value)
-    return response
 
 
 def _ms_since(start: float) -> float:

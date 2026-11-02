@@ -67,8 +67,14 @@ class RequestIDMiddleware:
                 MutableHeaders(scope=message)[HEADER] = request_id
             await send(message)
 
+        error: BaseException | None = None
         try:
             await self.app(scope, receive, send_with_id)
+        except BaseException as exc:
+            # Includes a response cut off mid-body (UpstreamStreamError): the
+            # status says 200, so the error field is what shows it failed.
+            error = exc
+            raise
         finally:
             peer = scope.get("client")
             fields = {
@@ -78,6 +84,8 @@ class RequestIDMiddleware:
                 "duration_ms": round((time.perf_counter() - start) * 1000, 2),
                 "client_ip": peer[0] if peer else None,
             }
+            if error is not None:
+                fields["error"] = type(error).__name__
             # Set by the auth middleware, which runs inside this one and
             # shares the same scope dict.
             api_client = scope.get("state", {}).get("api_client")
