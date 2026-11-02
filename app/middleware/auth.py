@@ -68,6 +68,8 @@ class AuthMiddleware:
         await self.app(scope, receive, send)
 
     async def _reject(self, scope: Scope, receive: Receive, send: Send, reason: str) -> None:
+        metric_reason = "missing_key" if reason == "missing api key" else "invalid_key"
+        scope["app"].state.metrics.auth_rejections.labels(metric_reason).inc()
         # Never log the key itself, not even a wrong one: a wrong key is
         # often a real key pasted into the wrong place.
         logger.warning(

@@ -42,6 +42,12 @@ def incoming_request_id(scope: Scope) -> str | None:
     return None
 
 
+def _unrouted_label(path: str) -> str:
+    # /health and /ready are few and fixed; anything else that never
+    # reached routing (a 401, a 429, a 404) is grouped as "none".
+    return path if path in ("/health", "/ready") else "none"
+
+
 class RequestIDMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -67,6 +73,8 @@ class RequestIDMiddleware:
                 MutableHeaders(scope=message)[HEADER] = request_id
             await send(message)
 
+        metrics = scope["app"].state.metrics
+        metrics.in_flight.inc()
         error: BaseException | None = None
         try:
             await self.app(scope, receive, send_with_id)
@@ -86,6 +94,13 @@ class RequestIDMiddleware:
             }
             if error is not None:
                 fields["error"] = type(error).__name__
+
+            # The route label is the matched prefix, set by the handler; never
+            # the raw path, which would mean one time series per URL.
+            route = scope.get("state", {}).get("route") or _unrouted_label(scope["path"])
+            metrics.in_flight.dec()
+            metrics.requests.labels(route, scope["method"], str(status_code)).inc()
+            metrics.request_duration.labels(route).observe(time.perf_counter() - start)
             # Set by the auth middleware, which runs inside this one and
             # shares the same scope dict.
             api_client = scope.get("state", {}).get("api_client")

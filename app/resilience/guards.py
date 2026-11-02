@@ -42,6 +42,10 @@ class UpstreamGuards:
             )
         return self._budgets[upstream]
 
+    def breakers(self) -> dict[str, CircuitBreaker]:
+        """Every breaker created so far, by upstream (a copy, for metrics)."""
+        return dict(self._breakers)
+
     def breaker_for(self, upstream: str, config: GatewayConfig) -> CircuitBreaker | None:
         if config.circuit_breaker is None:
             return None

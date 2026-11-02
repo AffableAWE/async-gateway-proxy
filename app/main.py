@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import GatewayConfig, load_config
 from app.logging_config import setup_logging
+from app.metrics import GatewayMetrics
 from app.middleware.auth import AuthMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIDMiddleware
@@ -115,6 +116,13 @@ def create_app(
     # should be proxied like any other path, not answered by FastAPI.
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
+    # Created with the app, not in the lifespan: `python -m app` starts the
+    # metrics server before uvicorn runs the lifespan.
+    app.state.metrics = GatewayMetrics()
+    app.state.metrics.watch_breakers(
+        lambda: app.state.guards.breakers() if hasattr(app.state, "guards") else {}
+    )
+
     # Middleware order: the LAST one added runs FIRST (outermost). So a
     # request passes RequestID -> Auth -> RateLimit -> routing.
     #   RequestID outermost: even a 401 or 429 is logged with an ID.
@@ -139,6 +147,8 @@ def create_app(
         config: GatewayConfig = request.app.state.config
 
         route = match_route(request.url.path, config)
+        if route is not None:
+            request.state.route = route.path_prefix  # the metrics label
         if route is None:
             logger.info(
                 "route_not_found",
@@ -157,6 +167,7 @@ def create_app(
         # now that the route is known, check the key may use it.
         api_client = getattr(request.state, "api_client", None)
         if api_client is not None and route.path_prefix not in api_client.routes:
+            request.app.state.metrics.auth_rejections.labels("route_not_allowed").inc()
             logger.warning(
                 "access_denied",
                 extra={

@@ -60,6 +60,17 @@ class CircuitBreaker:
             self._transition(State.HALF_OPEN)
         return self._state
 
+    def peek_state(self) -> State:
+        """The state right now, without changing anything.
+
+        `state` may move OPEN to HALF_OPEN as a side effect. Metrics are read
+        from another thread, so they use this instead and never mutate the
+        breaker behind the event loop's back.
+        """
+        if self._state is State.OPEN and self._clock() >= self._reopen_at():
+            return State.HALF_OPEN
+        return self._state
+
     def allow_request(self) -> bool:
         state = self.state
         if state is State.CLOSED:

@@ -12,7 +12,7 @@ again on a retry.
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 
 import httpx
@@ -20,6 +20,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import GatewayConfig, RouteConfig
+from app.metrics import GatewayMetrics
 from app.request_context import get_request_id
 from app.resilience.breaker import State
 from app.resilience.guards import UpstreamGuards
@@ -268,6 +269,8 @@ async def forward_request(
 ) -> Response:
     upstream_url = build_upstream_url(request.url.path, route, request.url.query)
     method = request.method
+    metrics: GatewayMetrics = request.app.state.metrics
+    upstream = route.upstream  # metrics label: the configured base URL, a small known set
 
     body = await _read_body(request, config.max_buffered_request_bytes)
     headers = _forwarded_headers(request)
@@ -299,6 +302,7 @@ async def forward_request(
             if result is None:
                 # Breaker open before the first try: fail fast, don't call.
                 retry_after = breaker.retry_after_seconds()
+                metrics.circuit_open_rejections.labels(upstream).inc()
                 logger.warning(
                     "circuit_open_rejected", extra={**log_fields, "retry_after_s": retry_after}
                 )
@@ -309,6 +313,8 @@ async def forward_request(
         result = await _send_once(
             client, method, upstream_url, headers, body, config.upstream_timeout_seconds
         )
+        outcome = "success" if result.failure is None else result.failure.value
+        metrics.upstream_attempts.labels(upstream, outcome).inc()
         if breaker is not None:
             if result.failure is None:
                 breaker.record_success()
@@ -323,6 +329,7 @@ async def forward_request(
             break
         if budget is not None and not budget.try_spend():
             logger.warning("retry_budget_exhausted", extra={**log_fields, "attempts": attempts})
+            metrics.retry_budget_exhausted.labels(upstream).inc()
             break
 
         delay = backoff_delay(
@@ -338,14 +345,21 @@ async def forward_request(
                 "delay_ms": round(delay * 1000, 2),
             },
         )
+        metrics.retries.labels(upstream).inc()
         await guards.sleep(delay)
 
     fields = {**log_fields, "attempts": attempts, "streamed_request": not body.replayable}
-    return _final_response(result, fields, start, body, config)
+    return _final_response(result, fields, start, body, config, metrics, upstream)
 
 
 def _final_response(
-    result: _Attempt, fields: dict, start: float, body: _Body, config: GatewayConfig
+    result: _Attempt,
+    fields: dict,
+    start: float,
+    body: _Body,
+    config: GatewayConfig,
+    metrics: GatewayMetrics,
+    upstream: str,
 ) -> Response:
     if isinstance(result.error, httpx.TimeoutException):
         logger.warning(
@@ -385,6 +399,7 @@ def _final_response(
         return response
 
     stream = _UpstreamStream(result.response, fields, start, body)
+    stream.on_abort = metrics.stream_aborts.labels(upstream).inc
     # Appended one by one, like above: a headers dict would merge repeated
     # headers such as Set-Cookie into one.
     for name, value in headers:
@@ -410,6 +425,7 @@ class _UpstreamStream(StreamingResponse):
         self._sent = 0
         self._finished = False  # whole body passed on
         self._failed = False  # upstream broke off
+        self.on_abort: Callable[[], None] | None = None
 
     async def _chunks(self) -> AsyncIterator[bytes]:
         try:
@@ -422,6 +438,8 @@ class _UpstreamStream(StreamingResponse):
                 yield chunk
         except httpx.HTTPError as exc:
             self._failed = True
+            if self.on_abort is not None:
+                self.on_abort()
             logger.error(
                 "upstream_stream_aborted",
                 extra={

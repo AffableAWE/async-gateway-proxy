@@ -82,6 +82,11 @@ class RateLimitMiddleware:
         # Retry-After takes whole seconds. Round up: rounding down would
         # tell the client to come back before a token exists.
         retry_after = max(1, math.ceil(decision.retry_after))
+        api_client = scope.get("state", {}).get("api_client")
+        # Client names come from config, a small known set. Bucket keys
+        # with auth off are client IPs, too many to use as a label.
+        client = api_client.client if api_client is not None else "anonymous"
+        scope["app"].state.metrics.rate_limited.labels(client).inc()
         logger.warning(
             "rate_limited",
             extra={
