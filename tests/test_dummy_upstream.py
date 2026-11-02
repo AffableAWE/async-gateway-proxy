@@ -41,3 +41,24 @@ def test_status_returns_the_code():
     assert client.get("/status/503").status_code == 503
     assert client.get("/status/204").status_code == 204
     assert client.get("/status/99").status_code == 400
+
+
+def test_large_sends_exactly_the_size_asked_for():
+    response = client.get("/large?mb=1")
+    assert response.headers["content-length"] == str(1024 * 1024)
+    assert len(response.content) == 1024 * 1024
+
+
+def test_stream_sends_each_chunk():
+    response = client.get("/stream?chunks=3&interval=0")
+    assert response.text == "chunk 1/3\nchunk 2/3\nchunk 3/3\n"
+    assert "content-length" not in response.headers
+
+
+def test_upload_reports_size_and_hash():
+    import hashlib
+
+    body = b"x" * 100_000
+    data = client.post("/upload", content=body).json()
+    assert data["bytes"] == 100_000
+    assert data["sha256"] == hashlib.sha256(body).hexdigest()
