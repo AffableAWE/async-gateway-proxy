@@ -42,6 +42,24 @@ class UpstreamGuards:
             )
         return self._budgets[upstream]
 
+    def apply_config(self, old: GatewayConfig, new: GatewayConfig) -> None:
+        """After a config reload: drop state that no longer matches the config.
+
+        Budgets and breakers are built with the settings in force when they
+        were created. If those settings changed, they are dropped and
+        rebuilt on next use, so new thresholds apply at once; a dropped
+        breaker starts again closed. State for upstreams no longer in any
+        route is dropped too.
+        """
+        if old.retries != new.retries:
+            self._budgets.clear()
+        if old.circuit_breaker != new.circuit_breaker:
+            self._breakers.clear()
+        live = {route.upstream for route in new.routes}
+        for table in (self._budgets, self._breakers):
+            for upstream in [u for u in table if u not in live]:
+                del table[upstream]
+
     def breakers(self) -> dict[str, CircuitBreaker]:
         """Every breaker created so far, by upstream (a copy, for metrics)."""
         return dict(self._breakers)

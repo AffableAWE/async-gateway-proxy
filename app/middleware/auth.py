@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import GatewayConfig
-from app.request_context import get_request_id
+from app.request_context import get_request_id, request_config
 
 logger = logging.getLogger("gateway.auth")
 
@@ -45,10 +45,9 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Read the config per request, not once in __init__: the config is
-        # loaded in the lifespan, after middleware is built, and Phase 7
-        # will swap it at runtime for hot reload.
-        config: GatewayConfig = scope["app"].state.config
+        # Per request, not once in __init__: the config is loaded in the
+        # lifespan, after middleware is built, and hot reload swaps it.
+        config: GatewayConfig = request_config(scope)
         if config.auth is None:  # auth is off
             await self.app(scope, receive, send)
             return

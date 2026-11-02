@@ -8,6 +8,11 @@ upstream_timeout_seconds: 5.0
 # Bigger ones are streamed straight through: flat memory, but no retries.
 max_buffered_request_bytes: 1048576   # 1 MiB
 
+# Hot reload: edit this file and the gateway picks it up within this many
+# seconds, no restart. A broken file is rejected and the old config kept.
+# 0 turns polling off; `kill -HUP <pid>` reloads on demand either way.
+reload_interval_seconds: 5
+
 routes:
   # Dummy upstream for local development:
   #   uvicorn dummy_upstream.main:app --port 8001

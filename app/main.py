@@ -6,6 +6,7 @@ Start it with:
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -13,6 +14,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.config import GatewayConfig, load_config
+from app.config.reload import ConfigReloader
 from app.health import readiness
 from app.logging_config import setup_logging
 from app.metrics import GatewayMetrics
@@ -22,7 +24,7 @@ from app.middleware.request_id import RequestIDMiddleware
 from app.proxy import forward_request
 from app.ratelimit import MemoryRateLimiter, RateLimiter
 from app.ratelimit.redis_backend import RedisRateLimiter
-from app.request_context import get_request_id
+from app.request_context import get_request_id, request_config
 from app.resilience.guards import UpstreamGuards
 from app.router import match_route
 
@@ -83,6 +85,28 @@ def create_app(
             if not await app.state.rate_limiter.ping():
                 logger.error("rate_limit_redis_unreachable_at_startup")
 
+        metrics: GatewayMetrics = app.state.metrics
+        metrics.config_loaded_at.set(time.time())
+
+        # Hot reload, only for config that came from a file (tests inject
+        # config objects directly).
+        reloader = None
+        if config is None:
+
+            def apply(old: GatewayConfig, new: GatewayConfig) -> None:
+                app.state.config = new  # one reference swap: atomic for readers
+                app.state.guards.apply_config(old, new)
+                metrics.config_loaded_at.set(time.time())
+
+            reloader = ConfigReloader(
+                config_path,
+                app.state.config,
+                apply,
+                on_result=lambda result: metrics.config_reloads.labels(result).inc(),
+            )
+            reloader.start()
+        app.state.reloader = reloader
+
         auth = app.state.config.auth
         logger.info(
             "gateway_startup",
@@ -102,6 +126,11 @@ def create_app(
                     else "off"
                 ),
                 "circuit_breaker": "on" if app.state.config.circuit_breaker is not None else "off",
+                "hot_reload": (
+                    f"every {app.state.config.reload_interval_seconds}s and on SIGHUP"
+                    if reloader is not None
+                    else "off"
+                ),
             },
         )
         if auth is None:
@@ -109,6 +138,8 @@ def create_app(
         try:
             yield
         finally:
+            if reloader is not None:
+                await reloader.stop()
             await app.state.rate_limiter.close()
             await app.state.http_client.aclose()
             logger.info("gateway_shutdown")
@@ -151,7 +182,7 @@ def create_app(
     # path and method lands here. `{full_path:path}` matches across slashes.
     @app.api_route("/{full_path:path}", methods=PROXY_METHODS)
     async def gateway(full_path: str, request: Request) -> Response:
-        config: GatewayConfig = request.app.state.config
+        config: GatewayConfig = request_config(request.scope)
 
         route = match_route(request.url.path, config)
         if route is not None:

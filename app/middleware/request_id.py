@@ -57,6 +57,9 @@ class RequestIDMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # One config per request: see request_config() in app/request_context.py.
+        scope.setdefault("state", {})["config"] = scope["app"].state.config
+
         request_id = incoming_request_id(scope) or str(uuid.uuid4())
         # set() returns a token; reset(token) restores the previous value.
         # Everything awaited below runs in this task and sees this ID.

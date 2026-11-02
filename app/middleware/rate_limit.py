@@ -21,7 +21,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.config import GatewayConfig
 from app.middleware.auth import PUBLIC_PATHS
 from app.ratelimit import Decision, Limit, RateLimiter
-from app.request_context import get_request_id
+from app.request_context import get_request_id, request_config
 
 logger = logging.getLogger("gateway.ratelimit")
 
@@ -54,7 +54,7 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        config: GatewayConfig = scope["app"].state.config
+        config: GatewayConfig = request_config(scope)
         if config.rate_limit is None:
             await self.app(scope, receive, send)
             return

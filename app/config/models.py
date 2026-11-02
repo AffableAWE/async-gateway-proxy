@@ -191,6 +191,9 @@ class GatewayConfig(BaseModel):
     # sent again on a retry. Bigger ones are streamed: constant memory, but
     # no retries. 1 MiB by default.
     max_buffered_request_bytes: int = Field(1024 * 1024, ge=0)
+    # How often to check config.yaml for changes and reload it, in seconds.
+    # 0 turns polling off; `kill -HUP <pid>` still reloads on demand.
+    reload_interval_seconds: float = Field(5.0, ge=0)
     auth: AuthConfig | None = None  # None: auth off, every request allowed
     rate_limit: RateLimitConfig | None = None  # None: no rate limiting
     retries: RetryConfig | None = None  # None: one attempt, no retries

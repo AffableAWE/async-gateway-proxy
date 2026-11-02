@@ -10,6 +10,10 @@ upstream, request B runs and would overwrite the value A reads next.
 """
 
 from contextvars import ContextVar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.config import GatewayConfig
 
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
@@ -17,3 +21,15 @@ request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 def get_request_id() -> str | None:
     """The current request's ID, or None outside a request (e.g. at startup)."""
     return request_id_var.get()
+
+
+def request_config(scope: dict) -> "GatewayConfig":
+    """The config this request runs under.
+
+    The outermost middleware stores a snapshot of app.state.config in the
+    request's scope, and everything after it reads that snapshot. A hot
+    reload can swap app.state.config at any await; without the snapshot, a
+    request could pass auth under the old config and be routed under the new.
+    """
+    snapshot = scope.get("state", {}).get("config")
+    return snapshot if snapshot is not None else scope["app"].state.config

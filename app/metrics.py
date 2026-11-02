@@ -122,6 +122,21 @@ class GatewayMetrics:
             registry=r,
         )
 
+        # --- config ---------------------------------------------------------
+        self.config_reloads = Counter(
+            "gateway_config_reloads",
+            "Config reload attempts that found a changed file: success, failed "
+            "(invalid file, old config kept) or rejected (needs a restart).",
+            ["result"],
+            registry=r,
+        )
+        self.config_loaded_at = Gauge(
+            "gateway_config_last_success_timestamp_seconds",
+            "Unix time the config in use was loaded. Alert if a deploy changed "
+            "the file but this didn't move.",
+            registry=r,
+        )
+
     def watch_breakers(self, breakers: Callable[[], dict[str, CircuitBreaker]]) -> None:
         self.registry.register(_BreakerCollector(breakers))
 

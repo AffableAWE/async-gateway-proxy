@@ -269,3 +269,17 @@ def test_request_buffer_limit_default_and_validation():
     assert GatewayConfig.model_validate({**ONE_ROUTE, "max_buffered_request_bytes": 0})
     with pytest.raises(ValidationError):
         GatewayConfig.model_validate({**ONE_ROUTE, "max_buffered_request_bytes": -1})
+
+
+def test_reload_interval_default_and_validation():
+    assert GatewayConfig.model_validate(ONE_ROUTE).reload_interval_seconds == 5
+    assert GatewayConfig.model_validate({**ONE_ROUTE, "reload_interval_seconds": 0})
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate({**ONE_ROUTE, "reload_interval_seconds": -1})
+
+
+def test_parse_config_reports_broken_yaml_as_a_config_error():
+    from app.config.loader import parse_config
+
+    with pytest.raises(ConfigError):
+        parse_config(b"routes: [not: valid")
