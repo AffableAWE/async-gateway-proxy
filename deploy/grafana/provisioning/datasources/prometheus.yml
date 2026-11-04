@@ -1,0 +1,13 @@
+# Loaded by Grafana at startup: the dashboard needs no clicking to set up.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus          # the dashboard refers to this uid
+    type: prometheus
+    access: proxy            # Grafana's server queries Prometheus, not the browser
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s       # matches the scrape interval, for $__rate_interval

@@ -1,0 +1,46 @@
+# Gateway config for docker-compose.
+#
+# Same schema as the top-level config.yaml; the differences are that
+# upstreams are compose service names (Docker's DNS resolves them), and
+# rate limiting uses Redis so every gateway replica shares one set of buckets.
+#
+# This folder is mounted into the container at /app/config. Edit this file
+# while the stack runs and the gateway reloads it within 5 s.
+
+upstream_timeout_seconds: 5.0
+max_buffered_request_bytes: 1048576
+reload_interval_seconds: 5
+
+routes:
+  # The small FastAPI test backend.
+  - path_prefix: /api
+    upstream: http://dummy-upstream:8001
+
+  # Your C++ HTTP server (github.com/AffableAWE/http-server, tag v2.1.0).
+  # /cpp/about -> http://cpp-server:8080/about
+  - path_prefix: /cpp
+    upstream: http://cpp-server:8080
+
+auth:
+  keys:
+    # LOCAL DEVELOPMENT ONLY. The key is "gw_dev_local_only"; it is public.
+    - client: local-dev
+      key_sha256: 1968b31589e9aad4699d926451a0cfc1a08d73878937987a8e2e3563a04f8193
+      routes: [/api, /cpp]
+
+rate_limit:
+  backend: redis
+  redis_url: redis://redis:6379/0
+  fail_open: true
+  default:
+    capacity: 50
+    refill_per_second: 25
+
+retries:
+  max_attempts: 3
+  base_delay_seconds: 0.05
+  max_delay_seconds: 1.0
+
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout_seconds: 10

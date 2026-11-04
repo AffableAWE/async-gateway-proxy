@@ -1,0 +1,57 @@
+# Alert rules. With no Alertmanager in this stack they are only shown on
+# http://localhost:9090/alerts, which is enough to see them fire.
+#
+# Each rule answers a question an on-call engineer would ask.
+
+groups:
+  - name: gateway
+    rules:
+      # Is the gateway itself down?
+      - alert: GatewayDown
+        expr: up{job="gateway"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus can't scrape the gateway"
+
+      # Are clients getting server errors?
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum(rate(gateway_requests_total{status=~"5.."}[1m]))
+            / sum(rate(gateway_requests_total[1m])) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of requests are failing with 5xx"
+
+      # Is the gateway slow? p99 over all routes.
+      - alert: GatewayHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(gateway_request_duration_seconds_bucket[5m]))) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency is above 1 s"
+
+      # Has an upstream gone away?
+      - alert: UpstreamCircuitOpen
+        expr: gateway_circuit_breaker_state == 2
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.upstream }}"
+
+      # Did someone deploy a broken config? The gateway keeps the old one,
+      # so nothing else would show it.
+      - alert: ConfigReloadFailing
+        expr: increase(gateway_config_reloads_total{result=~"failed|rejected"}[10m]) > 0
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "A config change was rejected; the gateway is running the previous config"

@@ -1,0 +1,106 @@
+# Unit tests for alerts.yml, run with:
+#   promtool test rules alerts_test.yml
+# (CI runs them in the prom/prometheus image.)
+#
+# Each test feeds Prometheus made-up series and checks which alerts fire.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 5s
+
+tests:
+  - name: healthy traffic fires nothing
+    interval: 5s
+    input_series:
+      - series: 'up{job="gateway"}'
+        values: "1x40"
+      - series: 'gateway_requests_total{route="/api",method="GET",status="200"}'
+        values: "0+100x40"
+      - series: 'gateway_requests_total{route="/api",method="GET",status="502"}'
+        values: "0+1x40"        # 1% errors: under the 5% line
+      - series: 'gateway_circuit_breaker_state{upstream="http://cpp-server:8080"}'
+        values: "0x40"
+    alert_rule_test:
+      - {eval_time: 3m, alertname: GatewayDown, exp_alerts: []}
+      - {eval_time: 3m, alertname: GatewayHighErrorRate, exp_alerts: []}
+      - {eval_time: 3m, alertname: UpstreamCircuitOpen, exp_alerts: []}
+      - {eval_time: 3m, alertname: ConfigReloadFailing, exp_alerts: []}
+
+  - name: gateway unreachable
+    interval: 5s
+    input_series:
+      - series: 'up{job="gateway"}'
+        values: "1 1 1 0x20"
+    alert_rule_test:
+      - eval_time: 10s
+        alertname: GatewayDown
+        exp_alerts: []          # just went down: not yet for 30 s
+      - eval_time: 1m
+        alertname: GatewayDown
+        exp_alerts:
+          - exp_labels: {job: gateway, severity: critical}
+            exp_annotations: {summary: "Prometheus can't scrape the gateway"}
+
+  - name: too many 5xx
+    interval: 5s
+    input_series:
+      - series: 'gateway_requests_total{route="/api",method="GET",status="200"}'
+        values: "0+90x40"
+      - series: 'gateway_requests_total{route="/api",method="GET",status="503"}'
+        values: "0+10x40"       # 10% errors
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GatewayHighErrorRate
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "More than 5% of requests are failing with 5xx"}
+
+  - name: slow requests
+    interval: 15s
+    input_series:
+      # Every request takes between 2.5 s and 5 s.
+      - series: 'gateway_request_duration_seconds_bucket{route="/api",le="1"}'
+        values: "0x30"
+      - series: 'gateway_request_duration_seconds_bucket{route="/api",le="2.5"}'
+        values: "0x30"
+      - series: 'gateway_request_duration_seconds_bucket{route="/api",le="5"}'
+        values: "0+10x30"
+      - series: 'gateway_request_duration_seconds_bucket{route="/api",le="+Inf"}'
+        values: "0+10x30"
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: GatewayHighLatency
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "p99 latency is above 1 s"}
+
+  - name: breaker opens
+    interval: 5s
+    input_series:
+      - series: 'gateway_circuit_breaker_state{upstream="http://cpp-server:8080"}'
+        values: "0 0 2 2"
+    alert_rule_test:
+      - eval_time: 5s
+        alertname: UpstreamCircuitOpen
+        exp_alerts: []
+      - eval_time: 15s
+        alertname: UpstreamCircuitOpen
+        exp_alerts:
+          - exp_labels: {upstream: "http://cpp-server:8080", severity: warning}
+            exp_annotations: {summary: "Circuit breaker open for http://cpp-server:8080"}
+
+  - name: broken config deployed
+    interval: 1m
+    input_series:
+      - series: 'gateway_config_reloads_total{result="failed"}'
+        values: "0 0 1 1 1"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ConfigReloadFailing
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: ConfigReloadFailing
+        exp_alerts:
+          - exp_labels: {result: failed, severity: warning}
+            exp_annotations: {summary: "A config change was rejected; the gateway is running the previous config"}

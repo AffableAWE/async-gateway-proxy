@@ -1,0 +1,110 @@
+# The whole system on one machine:
+#
+#   client --> gateway :8000 --+--> dummy-upstream :8001   (/api)
+#                 |            +--> cpp-server     :8080   (/cpp, your C++ server)
+#                 |            +--> redis          :6379   (shared rate-limit buckets)
+#                 +-- :9100 --> prometheus :9090 --> grafana :3000
+#
+#   docker compose up -d --build --wait
+#   open http://localhost:3000          (dashboard, no login)
+#   docker compose down
+#
+# Only the gateway's API port and the two UIs are published to your machine.
+# Upstreams, Redis and the metrics port are reachable only inside the compose
+# network, the same way they would be behind a real gateway.
+
+name: gateway
+
+services:
+  gateway:
+    build:
+      context: .
+      target: gateway
+    ports:
+      - "8000:8000"
+    environment:
+      LOG_LEVEL: INFO
+      GATEWAY_CONFIG: /app/config/config.yaml
+    volumes:
+      # The folder, not the single file. Editors save by writing a new file
+      # and renaming it over the old one; a single-file bind mount keeps
+      # pointing at the old file, so hot reload would never see the edit.
+      - ./deploy/gateway:/app/config:ro
+    depends_on:
+      dummy-upstream:
+        condition: service_healthy
+      cpp-server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Longer than the gateway's own 25 s drain, so Docker doesn't SIGKILL it
+    # while in-flight requests are finishing.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  dummy-upstream:
+    build:
+      context: .
+      target: dummy-upstream
+    restart: unless-stopped
+
+  cpp-server:
+    # Built straight from your C++ repo at a fixed tag, so this stack always
+    # gets the same server. Bump the tag to pick up a new release.
+    build:
+      context: https://github.com/AffableAWE/http-server.git#v2.1.0
+    environment:
+      ENABLE_LOGGING: "false"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    # Rate-limit buckets are short-lived and rebuild themselves: no need to
+    # save them to disk.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Local demo: open the dashboard without logging in, read-only.
+      # Never do this on a server anyone else can reach.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/gateway.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    restart: unless-stopped
