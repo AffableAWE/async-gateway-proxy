@@ -15,6 +15,10 @@ a Kubernetes manifest or a person typing commands can't forget one:
                           deploy forever. Kubernetes allows 30 s by default
                           before it sends SIGKILL, so stay under that.
 
+Exit code: a graceful SIGTERM exits 0. uvicorn on its own re-raises the
+SIGTERM after draining, so the process ends "killed by signal" (exit 143),
+and Kubernetes then records every normal rollout as an Error. See main().
+
 Settings come from environment variables, the usual way to configure a
 process inside a container:
 
@@ -31,6 +35,8 @@ off the same way.
 """
 
 import os
+import signal
+import sys
 
 import uvicorn
 from prometheus_client import start_http_server
@@ -62,6 +68,10 @@ def start_metrics_server(registry: CollectorRegistry, host: str, port: int) -> i
     return server.server_port
 
 
+def _exit_cleanly(signum: int, frame: object) -> None:
+    sys.exit(0)
+
+
 def main() -> None:
     from app.main import app  # imported here so tests can import server_config cheaply
 
@@ -69,4 +79,10 @@ def main() -> None:
     metrics_port = int(os.getenv("GATEWAY_METRICS_PORT", "9100"))
     if metrics_port:
         start_metrics_server(app.state.metrics.registry, config.host, metrics_port)
+    # uvicorn swaps in its own SIGTERM handler while serving, then puts this
+    # one back and re-raises the signal once the drain is done. So this runs
+    # after a clean drain (exit 0 instead of 143). A SIGTERM that arrives
+    # before uvicorn starts also lands here: nothing is in flight yet, so
+    # exiting at once is right.
+    signal.signal(signal.SIGTERM, _exit_cleanly)
     uvicorn.Server(config).run()

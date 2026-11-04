@@ -7,7 +7,12 @@ still streaming when the signal arrives.
 
 import asyncio
 import logging
+import os
+import signal
 import socket
+import subprocess
+import sys
+import time
 
 import httpx
 import pytest
@@ -135,3 +140,45 @@ def test_server_flags(monkeypatch):
     assert config.proxy_headers is False
     assert config.access_log is False
     assert config.lifespan == "on"
+
+
+def test_sigterm_drains_and_exits_0(tmp_path):
+    # The real process, the real signal: what `docker stop` and Kubernetes
+    # do. Exit code 0 matters: 143 ("killed by SIGTERM") makes every normal
+    # rollout show up as an Error in `kubectl describe pod`.
+    config = tmp_path / "config.yaml"
+    config.write_text("routes:\n  - path_prefix: /api\n    upstream: http://127.0.0.1:9\n")
+    port = free_socket().getsockname()[1]
+    env = {
+        **os.environ,
+        "GATEWAY_CONFIG": str(config),
+        "GATEWAY_PORT": str(port),
+        "GATEWAY_METRICS_PORT": "0",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "app"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                if httpx.get(f"http://127.0.0.1:{port}/health", timeout=1).status_code == 200:
+                    break
+            except httpx.TransportError:
+                pass
+            assert proc.poll() is None, proc.stdout.read()
+            assert time.monotonic() < deadline, "gateway didn't start"
+            time.sleep(0.1)
+
+        proc.send_signal(signal.SIGTERM)
+        output, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert proc.returncode == 0, output
+    assert "gateway_shutdown" in output  # the drain and the app's shutdown ran
