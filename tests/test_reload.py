@@ -95,6 +95,13 @@ def test_a_new_route_works_after_reload(gateway, config_file):
 
     assert client.get("/cpp/x").status_code == 200
     assert metric(client, "success") == 1
+    # The new upstream's failure counters start at 0 too (see test_metrics).
+    assert (
+        client.app.state.metrics.registry.get_sample_value(
+            "gateway_upstream_retries_total", {"upstream": "http://up-b"}
+        )
+        == 0
+    )
 
 
 def test_a_revoked_key_stops_working_at_once(gateway, config_file):

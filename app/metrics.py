@@ -20,18 +20,35 @@ Each app gets its own registry instead of prometheus_client's global one,
 so tests can build many apps without "metric already registered" errors.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    disable_created_metrics,
+    generate_latest,
+)
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.registry import Collector
 
 from app.resilience.breaker import CircuitBreaker, State
 
+# prometheus_client adds a `<name>_created` series per counter and histogram
+# by default: the Unix time it was created. Prometheus doesn't need it, and
+# it doubles the lines on the page. Must be called before metrics are made.
+disable_created_metrics()
+
 # Seconds. Fine-grained at the low end, where a gateway's own overhead lives.
 LATENCY_BUCKETS = (0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30)
 
 BREAKER_STATE_VALUE = {State.CLOSED: 0, State.HALF_OPEN: 1, State.OPEN: 2}
+
+# Label values known in advance. Their series are created at 0 at startup
+# (see GatewayMetrics.__init__ and track_upstreams).
+RELOAD_RESULTS = ("success", "failed", "rejected")
+AUTH_REJECTION_REASONS = ("missing_key", "invalid_key", "route_not_allowed")
 
 
 class _BreakerCollector(Collector):
@@ -136,6 +153,31 @@ class GatewayMetrics:
             "the file but this didn't move.",
             registry=r,
         )
+
+        # Start the known series at 0. A labelled counter has no series until
+        # its first .inc(), and then it first appears already at 1. rate()
+        # and increase() need two samples to see a change, so they never see
+        # that first 0 -> 1: an alert on increase(...{result="failed"}) would
+        # miss the first bad reload after every restart.
+        for result in RELOAD_RESULTS:
+            self.config_reloads.labels(result)
+        for reason in AUTH_REJECTION_REASONS:
+            self.auth_rejections.labels(reason)
+
+    def track_upstreams(self, upstreams: Iterable[str]) -> None:
+        """Start the per-upstream failure counters at 0 for these upstreams.
+
+        Called at startup and after each reload. Safe to repeat: .labels()
+        on an existing series returns it unchanged.
+        """
+        for upstream in upstreams:
+            for counter in (
+                self.retries,
+                self.retry_budget_exhausted,
+                self.circuit_open_rejections,
+                self.stream_aborts,
+            ):
+                counter.labels(upstream)
 
     def watch_breakers(self, breakers: Callable[[], dict[str, CircuitBreaker]]) -> None:
         self.registry.register(_BreakerCollector(breakers))

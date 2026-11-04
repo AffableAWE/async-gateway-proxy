@@ -87,6 +87,7 @@ def create_app(
 
         metrics: GatewayMetrics = app.state.metrics
         metrics.config_loaded_at.set(time.time())
+        metrics.track_upstreams(route.upstream for route in app.state.config.routes)
 
         # Hot reload, only for config that came from a file (tests inject
         # config objects directly).
@@ -97,6 +98,7 @@ def create_app(
                 app.state.config = new  # one reference swap: atomic for readers
                 app.state.guards.apply_config(old, new)
                 metrics.config_loaded_at.set(time.time())
+                metrics.track_upstreams(route.upstream for route in new.routes)
 
             reloader = ConfigReloader(
                 config_path,

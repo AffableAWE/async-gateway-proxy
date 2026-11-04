@@ -180,3 +180,31 @@ def test_metrics_server_serves_the_registry():
 def test_metrics_are_not_on_the_main_port(gateway):
     # /metrics on the public port is just another path: auth asks for a key.
     assert gateway(ok).get("/metrics").status_code == 401
+
+
+def test_no_created_timestamp_series(gateway):
+    client = gateway(ok)
+    client.get("/api/a", headers=AUTH)
+    assert "_created" not in client.app.state.metrics.render().decode()
+
+
+def test_known_series_exist_at_zero_before_anything_happens(gateway):
+    # A series that only appears on its first .inc() appears at 1, and
+    # rate()/increase() never see that first step. So alerts on these
+    # (ConfigReloadFailing, for one) need them to exist at 0 from startup.
+    client = gateway(ok)
+    registry = client.app.state.metrics.registry
+    sample = registry.get_sample_value  # None = the series doesn't exist
+
+    for result in ("success", "failed", "rejected"):
+        assert sample("gateway_config_reloads_total", {"result": result}) == 0
+    for reason in ("missing_key", "invalid_key", "route_not_allowed"):
+        assert sample("gateway_auth_rejections_total", {"reason": reason}) == 0
+    for upstream in ("http://up-a", "http://up-b"):
+        for name in (
+            "gateway_upstream_retries_total",
+            "gateway_retry_budget_exhausted_total",
+            "gateway_circuit_open_rejections_total",
+            "gateway_upstream_stream_aborts_total",
+        ):
+            assert sample(name, {"upstream": upstream}) == 0, (name, upstream)
