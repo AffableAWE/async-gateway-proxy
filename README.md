@@ -8,9 +8,10 @@ the backend's response. It is built to sit in front of a custom multithreaded
 C++ HTTP server.
 
 The project is built in phases. This README describes what exists now
-(up to Phase 7: core proxy, request tracing, API key auth, rate limiting,
-retries, circuit breaking, streaming, graceful shutdown, metrics, readiness
-and hot reload). Later phases are listed under [Roadmap](#roadmap).
+(up to Phase 8: core proxy, request tracing, API key auth, rate limiting,
+retries, circuit breaking, streaming, graceful shutdown, metrics, readiness,
+hot reload, and the whole system in Docker with Prometheus and Grafana).
+Later phases are listed under [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -106,6 +107,75 @@ serves other requests on the same thread.
   (`upstream_ms`, request and response sizes). The gap between the two
   times is the gateway's own overhead.
 
+## Run the whole stack with Docker
+
+The quickest way to see everything: one command starts the gateway, a test
+backend, the [C++ server](https://github.com/AffableAWE/http-server) it was
+built for, Redis, Prometheus and Grafana.
+
+```bash
+make up            # = docker compose up -d --build --wait
+make smoke         # end-to-end check, 20 checks
+make traffic       # 2 minutes of mixed traffic, then open the dashboard
+make down
+```
+
+```
+client --> gateway :8000 --+--> dummy-upstream :8001  (/api)
+              |            +--> cpp-server     :8080  (/cpp)
+              |            +--> redis          :6379  (shared rate-limit buckets)
+              +-- :9100 --> prometheus :9090 --> grafana :3000
+```
+
+| URL | What |
+|---|---|
+| http://localhost:8000 | the gateway (`X-API-Key: gw_dev_local_only`) |
+| http://localhost:3000 | Grafana: the "API Gateway" dashboard, no login |
+| http://localhost:9090 | Prometheus: Status → Targets, and Alerts |
+
+```bash
+K="X-API-Key: gw_dev_local_only"
+curl localhost:8000/cpp/ -H "$K"          # your C++ server, through the gateway
+curl localhost:8000/api/items/1 -H "$K"   # the dummy upstream
+```
+
+What each piece does, and why it's set up that way:
+
+- **One Dockerfile, two images.** `--target gateway` (the default) and
+  `--target dummy-upstream`, so the test backend never ships in the
+  gateway image. Both are multi-stage: dependencies are installed into a
+  virtualenv in one stage, and only that folder is copied into the final
+  image, with no pip cache or build tools.
+- **Non-root, read-only code.** The process runs as uid 10001. The code is
+  owned by root, so a compromised process can't rewrite what it runs.
+- **PID 1 gets SIGTERM.** `CMD` is in exec form, so `docker stop` reaches
+  Python directly and starts the graceful drain. A shell wrapper would
+  swallow the signal and Docker would SIGKILL after 10 s.
+  `stop_grace_period: 30s` is longer than the 25 s drain.
+- **The C++ server is built from its git tag** (`v2.1.0`), so this stack
+  always runs a known version of it.
+- **Only three ports are published.** The upstreams, Redis and the metrics
+  port are reachable only inside the compose network, as behind a real
+  gateway. Prometheus and Grafana bind to `127.0.0.1` only.
+- **The config folder is mounted, not the file.** Editors save by writing a
+  new file and renaming it over the old one. A single-file bind mount keeps
+  pointing at the old file, so hot reload would never see the change.
+  Edit `deploy/gateway/config.yaml` and the gateway reloads within 5 s.
+- **Prometheus alert rules** (`deploy/prometheus/alerts.yml`): gateway down,
+  5xx above 5%, p99 above 1 s, a circuit open, a config reload failing.
+  `alerts_test.yml` feeds fake series through them with `promtool`.
+- **Grafana is provisioned from files.** The datasource and dashboard load
+  at startup, nothing to click. The JSON in git is the source of truth;
+  edits in the UI are not saved.
+
+Checks that run in CI on every push (`.github/workflows/ci.yml`, job
+`stack`): the smoke test, every dashboard query returning data after
+traffic (`scripts/check_dashboard.py`), the process running as uid 10001,
+hot reload through the mounted folder, and `docker compose stop` exiting 0
+after a logged drain.
+
+Without `make`: the commands are in the `Makefile`, one line each.
+
 ## Project layout
 
 ```
@@ -138,7 +208,18 @@ app/
 dummy_upstream/
   main.py            small FastAPI backend for local testing
 tests/               pytest suite, no network needed
-config.yaml          routing table
+config.yaml          routing table (local runs)
+Dockerfile           gateway and dummy-upstream images
+docker-compose.yml   the whole stack
+Makefile             shortcuts: make up, smoke, traffic, down
+deploy/
+  gateway/           the gateway config used by docker-compose
+  prometheus/        scrape config, alert rules and their tests
+  grafana/           datasource, dashboard provider, dashboard JSON
+scripts/
+  smoke_test.sh      end-to-end check of the running stack
+  traffic.py         mixed traffic, to fill the dashboard
+  check_dashboard.py checks every dashboard query returns data
 ```
 
 ## Run it locally
@@ -428,6 +509,13 @@ shutdown, which closes the upstream connection pool. Measured: SIGTERM 1 s
 into a 2.5 s stream; the stream finished intact, a new request during the
 drain was refused, and the process exited as soon as the stream ended.
 
+A drained shutdown exits with code **0**. Left alone, uvicorn re-raises the
+SIGTERM after draining, so the process ends "killed by signal" (exit 143)
+and Kubernetes records every normal rollout as an `Error`. `python -m app`
+installs a SIGTERM handler before uvicorn starts. uvicorn restores that
+handler after the drain and re-raises the signal into it, and the handler
+exits 0. A test sends a real SIGTERM to a real `python -m app` process.
+
 ## Observability and operations
 
 ### Metrics
@@ -480,6 +568,16 @@ Design choices:
   breaker state behind the event loop.
 - **One registry per app,** not `prometheus_client`'s global one, so tests
   can build many apps side by side.
+- **Known series start at 0.** A labelled counter has no series until its
+  first increment, and then it first appears already at 1. `rate()` and
+  `increase()` need two samples to see a change, so they miss that first
+  step: the `ConfigReloadFailing` alert didn't fire for the first bad
+  reload after a restart. Found by running the stack, not by the rule
+  tests (those start at 0). Reload results, auth reasons and each
+  configured upstream's failure counters are now created at 0 at startup
+  and after each reload. A dashboard panel then shows 0, not "No data".
+- **No `_created` series.** `prometheus_client` adds a creation timestamp
+  per counter by default. Prometheus doesn't need it, so it's switched off.
 
 ### Liveness and readiness
 
@@ -652,8 +750,15 @@ run against a real server:
 REDIS_URL=redis://localhost:6379/0 pytest
 ```
 
+`tests/test_deploy_config.py` checks the docker-compose files agree with the
+code: the deploy config loads, every upstream is a compose service, and
+every metric used by the dashboard or the alert rules is one the gateway
+actually exports. Rename a metric and forget the dashboard, and it fails.
+
 CI runs lint and tests on Python 3.12, 3.13 and 3.14 for every push, with a
-real Redis service container.
+real Redis service container. Two more jobs: `promtool` checks and tests the
+alert rules, and `stack` builds and checks the whole docker-compose stack
+(see [Run the whole stack with Docker](#run-the-whole-stack-with-docker)).
 
 ## Limitations
 
@@ -693,6 +798,12 @@ real Redis service container.
   proxy would usually trust it only from known internal callers.
 - Request IDs are not full distributed tracing: there are no spans or
   parent/child timings. OpenTelemetry would add that.
+- The docker-compose stack is for one machine and for trying things out.
+  Grafana allows anonymous viewing and the admin password is `admin`, and
+  the dev API key is public (it's in this README). Fine on `localhost`,
+  never on a reachable server. Kubernetes (Phase 10) uses Secrets.
+- Alerts are evaluated but go nowhere: there's no Alertmanager to send
+  them to a person. They're visible in Prometheus under Alerts.
 
 ## Roadmap
 
@@ -705,6 +816,6 @@ real Redis service container.
 | 5     | Retries with backoff and jitter, retry budget, circuit breaker (done) |
 | 6     | Streaming bodies and graceful shutdown (done) |
 | 7     | Readiness probe, Prometheus metrics, config hot reload (done) |
-| 8     | Docker and docker-compose (gateway, upstream, C++ server, Redis, Prometheus) |
+| 8     | Docker and docker-compose (gateway, upstream, C++ server, Redis, Prometheus, Grafana) (done) |
 | 9     | Load testing and benchmarks against direct and NGINX baselines |
 | 10    | Kubernetes manifests and deployment on a k3s VPS |
