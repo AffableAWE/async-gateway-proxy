@@ -44,3 +44,70 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+  # Alert rules: syntax, plus unit tests that feed fake series through them.
+  prometheus-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: promtool check and test
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/p:ro" -w /p --entrypoint promtool \
+            prom/prometheus:v3.5.0 check rules alerts.yml
+          docker run --rm -v "$PWD/deploy/prometheus:/p:ro" -w /p --entrypoint promtool \
+            prom/prometheus:v3.5.0 test rules alerts_test.yml
+
+  # The whole docker-compose stack, built and checked end to end.
+  stack:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the Dockerfile
+        run: docker build --check .
+
+      - name: Start the stack
+        run: docker compose up -d --build --wait --wait-timeout 300
+
+      - name: Smoke test
+        run: ./scripts/smoke_test.sh
+
+      - name: Runs as non-root
+        run: test "$(docker compose exec -T gateway id -u)" = 10001
+
+      - name: Every dashboard query has data
+        run: |
+          python3 scripts/traffic.py --seconds 30 --rps 20
+          sleep 10  # two scrapes, so the last requests are in Prometheus
+          python3 scripts/check_dashboard.py
+
+      - name: Hot reload through the mounted config folder
+        run: |
+          K="X-API-Key: gw_dev_local_only"
+          curl -si localhost:8000/api/items/1 -H "$K" | grep -i '^x-ratelimit-limit: 50'
+          # sed -i writes a new file and renames it over the old one, like
+          # most editors. Only a folder mount sees that change.
+          sed -i 's/capacity: 50/capacity: 60/' deploy/gateway/config.yaml
+          for i in $(seq 20); do
+            curl -si localhost:8000/api/items/1 -H "$K" | grep -qi '^x-ratelimit-limit: 60' \
+              && echo "reloaded after ~${i}s" && exit 0
+            sleep 1
+          done
+          echo "config change not picked up" && exit 1
+
+      - name: Graceful stop (SIGTERM reaches the gateway, exit code 0)
+        run: |
+          docker compose stop gateway
+          code=$(docker inspect --format '{{.State.ExitCode}}' "$(docker compose ps -aq gateway)")
+          echo "exit code $code"
+          test "$code" = 0
+          docker compose logs gateway | grep -q gateway_shutdown
+
+      - name: Logs
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
